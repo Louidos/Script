@@ -1,0 +1,6 @@
+Zone;Name;Typ;Wert;Prioritaet;Gewicht;Port
+ad.firma.ch;drucker-buero;A;192.168.1.30;;;
+ad.firma.ch;intranet;CNAME;srv01.ad.firma.ch;;;
+ad.firma.ch;@;MX;mail.firma.ch;10;;
+ad.firma.ch;@;TXT;v=spf1 mx -all;;;
+ad.firma.ch;_sip._tcp;SRV;sip.ad.firma.ch;0;100;5060
