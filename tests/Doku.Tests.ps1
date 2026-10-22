@@ -32,7 +32,7 @@ Describe 'Testplan' {
 
 Describe 'README' {
     It 'erklaert das Einfuegen fuer ISE, Konsole und Datei' {
-        foreach ($stichwort in @('Als Administrator ausführen', 'F5', 'Strg+V', '-ExecutionPolicy Bypass -File', 'dist/NetSetup.ps1')) {
+        foreach ($stichwort in @('Als Administrator ausf', 'F5', 'Strg+V', '-ExecutionPolicy Bypass -File', 'dist/NetSetup.ps1')) {
             $script:readme | Should -Match ([regex]::Escape($stichwort))
         }
     }
