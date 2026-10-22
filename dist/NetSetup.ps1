@@ -1,5 +1,5 @@
 <#
-    NetSetup 0.0.0 (Build 2026-10-22 21:37)
+    NetSetup 0.0.0 (Build 2026-10-22 21:45)
     AD, DNS und DHCP auf Windows Server einrichten, verwalten und reparieren.
 #
     So starten (PowerShell oder PowerShell ISE als Administrator):
@@ -14,7 +14,7 @@
 #>
 $NetSetupCode = {
 $script:NetSetupVersion = '0.0.0'
-$script:NetSetupBuildDatum = '2026-10-22 21:37'
+$script:NetSetupBuildDatum = '2026-10-22 21:45'
 # ----------------------------------------------------------------------
 # src/core/Zustand.ps1
 # ----------------------------------------------------------------------
@@ -4967,6 +4967,1137 @@ function Show-NetDnsMenu {
         @{ Text = 'DNS-Rolle installieren / pruefen'; Aktion = { Install-NetDnsRole | Out-Null }; Hilfe = 'Installiert die DNS-Server-Rolle und die Verwaltungstools aus dem lokalen Windows, falls sie fehlen.' }
     )
     Show-NetMenu -Titel 'DNS' -Eintraege $eintraege
+}
+# ----------------------------------------------------------------------
+# src/dhcp/DhcpBasis.ps1
+# ----------------------------------------------------------------------
+# DHCP-Grundlagen: Rolle installieren und nachkonfigurieren, Autorisierung im AD, Bindungen.
+#
+function Test-NetEnterpriseAdmin {
+    <#
+    .SYNOPSIS
+        Prueft ueber die SID (endet auf -519), ob das Konto Mitglied der Organisations-Admins ist.
+    #>
+    try {
+        $id = [Security.Principal.WindowsIdentity]::GetCurrent()
+        foreach ($g in $id.Groups) { if ($g.Value -match '^S-1-5-21-\d+-\d+-\d+-519$') { return $true } }
+    }
+    catch { Write-Log -Level Debug -Message 'Gruppenmitgliedschaften nicht lesbar.' }
+    return $false
+}
+#
+function Get-NetServerFqdn {
+    $domaene = Get-NetDomainName
+    if ($domaene) { return ('{0}.{1}' -f [Environment]::MachineName, $domaene).ToLower() }
+    return [Environment]::MachineName.ToLower()
+}
+#
+function Complete-NetDhcpPostInstall {
+    <#
+    .SYNOPSIS
+        Nachkonfiguration nach der Rolleninstallation: Sicherheitsgruppen, ConfigurationState = 2,
+        Dienst neu starten (ersetzt den Assistenten im Server-Manager).
+    #>
+    $status = Get-NetSafe -Beschreibung 'ConfigurationState' -Abfrage { (Get-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\ServerManager\Roles\12' -Name ConfigurationState).ConfigurationState }
+    if ([int]$status -eq 2) {
+        Write-Log -Level OK -Message 'Die DHCP-Nachkonfiguration ist bereits erledigt.'
+        return $true
+    }
+    $r = Invoke-NetChange -Titel 'DHCP-Nachkonfiguration abschliessen' -Stufe Bestaetigen -Vorher ('ConfigurationState = {0} (Server-Manager zeigt "Konfiguration erforderlich")' -f $(if ($null -ne $status) { $status } else { 'fehlt' })) `
+        -Nachher 'Sicherheitsgruppen DHCP-Administratoren/DHCP-Benutzer angelegt, ConfigurationState = 2, Dienst neu gestartet' -Aktion {
+        Add-DhcpServerSecurityGroup
+        if (-not (Test-Path -Path 'HKLM:\SOFTWARE\Microsoft\ServerManager\Roles\12')) { New-Item -Path 'HKLM:\SOFTWARE\Microsoft\ServerManager\Roles\12' -Force | Out-Null }
+        Set-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\ServerManager\Roles\12' -Name ConfigurationState -Value 2
+        Restart-Service -Name DHCPServer -Force
+    }
+    return [bool]($r.Erfolg -and -not $r.Probelauf)
+}
+#
+function Install-NetDhcpRole {
+    <#
+    .SYNOPSIS
+        Installiert die DHCP-Rolle mit Tools (falls noetig) und fuehrt die Nachkonfiguration aus.
+    #>
+    $f = Get-NetFeatureState
+    if (-not ($f['DHCP'] -eq 'Installed' -and $f['RSAT-DHCP'] -eq 'Installed' -and (Test-NetCommand -Name 'Get-DhcpServerv4Scope'))) {
+        $namen = @()
+        if ($f['DHCP'] -ne 'Installed') { $namen += 'DHCP' }
+        if ($f['RSAT-DHCP'] -ne 'Installed') { $namen += 'RSAT-DHCP' }
+        if ($namen.Count -eq 0) { $namen = @('RSAT-DHCP') }
+        $r = Invoke-NetChange -Titel ('Windows-Funktion(en) installieren: ' + ($namen -join ', ')) -Stufe Bestaetigen `
+            -Vorher @{ DHCP = (ConvertTo-NetFeatureText -Status $f['DHCP']); 'RSAT-DHCP' = (ConvertTo-NetFeatureText -Status $f['RSAT-DHCP']) } -Nachher @{ DHCP = 'installiert'; 'RSAT-DHCP' = 'installiert' } -Aktion {
+            $erg = Install-WindowsFeature -Name $namen -IncludeManagementTools
+            if ($erg -and $erg.PSObject.Properties['Success'] -and -not $erg.Success) { throw 'Die Installation ist fehlgeschlagen.' }
+            Import-Module DhcpServer -ErrorAction SilentlyContinue
+        } -Rueckgaengig @{ Befehl = 'Uninstall-WindowsFeature'; Parameter = @{ Name = $namen } }
+        if (-not $r.Erfolg -or $r.Probelauf) { return $false }
+    }
+    else { Write-Log -Level OK -Message 'DHCP-Rolle und Verwaltungstools sind installiert.' }
+    return (Complete-NetDhcpPostInstall)
+}
+#
+function Test-NetDhcpReady {
+    <#
+    .SYNOPSIS
+        Prueft, ob DHCP verwaltet werden kann; bietet sonst Installation bzw. Dienststart an.
+    #>
+    param([switch]$Still)
+    $dienst = Get-NetSafe -Beschreibung 'Dienst DHCPServer' -Abfrage { Get-Service -Name DHCPServer }
+    if ((Test-NetCommand -Name 'Get-DhcpServerv4Scope') -and $dienst) {
+        if ([string]$dienst.Status -ne 'Running') {
+            Write-Log -Level Warn -Message 'Der DHCP-Dienst laeuft nicht.'
+            if (-not $Still -and (Read-NetYesNo -Frage 'DHCP-Dienst jetzt starten?' -Vorschlag $true)) {
+                $r = Invoke-NetChange -Titel 'DHCP-Dienst starten' -Stufe Automatisch -Aktion { Start-Service -Name DHCPServer }
+                return [bool]$r.Erfolg
+            }
+            return $false
+        }
+        return $true
+    }
+    if ($Still) { return $false }
+    Write-Log -Level Warn -Message 'Der DHCP-Server ist auf diesem Server nicht (vollstaendig) installiert.'
+    if (Read-NetYesNo -Frage 'DHCP-Rolle jetzt installieren?' -Vorschlag $true) { return (Install-NetDhcpRole) }
+    return $false
+}
+#
+function Test-NetDhcpAuthorized {
+    <#
+    .SYNOPSIS
+        Liefert $true (autorisiert), $false (nicht autorisiert) oder $null (keine Domaene).
+    #>
+    $einst = Get-NetSafe -Beschreibung 'Get-DhcpServerSetting' -Abfrage { Get-DhcpServerSetting }
+    if (-not $einst) { return $null }
+    if (-not $einst.IsDomainJoined) { return $null }
+    return [bool]$einst.IsAuthorized
+}
+#
+function Add-NetDhcpAuthorization {
+    <#
+    .SYNOPSIS
+        Autorisiert den DHCP-Server im AD (Add-DhcpServerInDC). Ohne Domaene wird uebersprungen.
+    #>
+    if (-not (Test-NetDhcpReady)) { return $false }
+    $status = Test-NetDhcpAuthorized
+    if ($null -eq $status) {
+        Write-Log -Message 'Der Server ist in keiner Domaene: eine Autorisierung ist nicht noetig und wird uebersprungen.'
+        return $true
+    }
+    if ($status) { Write-Log -Level OK -Message 'Der DHCP-Server ist im AD autorisiert.'; return $true }
+    if (-not (Test-NetEnterpriseAdmin)) {
+        Write-Log -Level Warn -Message 'Das angemeldete Konto ist nicht in der Gruppe Organisations-Admins (Enterprise Admins).'
+        Write-NetText -Text "Die Autorisierung schreibt in den Konfigurationsbereich der Gesamtstruktur. Das duerfen nur Organisations-Admins`n(oder Konten, denen das Recht delegiert wurde). Moeglichkeiten:`n  - mit einem Konto aus Organisations-Admins anmelden und NetSetup erneut starten, oder`n  - einen Organisations-Admin bitten, auf einem DC auszufuehren:`n      Add-DhcpServerInDC -DnsName $(Get-NetServerFqdn) -IPAddress <IP dieses Servers>" -Farbe Yellow
+        if (-not (Read-NetYesNo -Frage 'Trotzdem versuchen (falls das Recht delegiert ist)?' -Vorschlag $false)) { return $false }
+    }
+    $fqdn = Get-NetServerFqdn
+    $karte = @((Get-NetSetupState).Netzwerk.AktiveKarten) | Select-Object -First 1
+    $ip = ''
+    if ($karte) { $ip = ($karte.Adressen | Select-Object -First 1).IP }
+    $r = Invoke-NetChange -Titel "DHCP-Server $fqdn im AD autorisieren" -Stufe Bestaetigen -Vorher 'nicht autorisiert (vergibt keine Adressen)' -Nachher ('autorisiert: {0} ({1})' -f $fqdn, $ip) -Aktion {
+        if ($ip) { Add-DhcpServerInDC -DnsName $fqdn -IPAddress $ip } else { Add-DhcpServerInDC -DnsName $fqdn }
+    } -Rueckgaengig @{ Befehl = 'Remove-DhcpServerInDC'; Parameter = @{ DnsName = $fqdn; IPAddress = $ip } }
+    if ($r.Erfolg -and -not $r.Probelauf) { Write-Log -Message 'Hinweis: Es kann einige Minuten dauern, bis der Dienst die Autorisierung bemerkt.' }
+    return [bool]($r.Erfolg -and -not $r.Probelauf)
+}
+#
+function Show-NetDhcpBinding {
+    if (-not (Test-NetDhcpReady)) { return }
+    Write-NetTitle -Titel 'DHCP-Bindungen (auf welchen Netzwerkkarten DHCP antwortet)'
+    $z = Get-NetSetupState
+    foreach ($b in @($z.Dhcp.Bindungen)) {
+        $karte = @($z.Netzwerk.Karten | Where-Object { $_.Name -eq $b.Karte }) | Select-Object -First 1
+        $hinweis = ''
+        if ($karte -and $karte.Dhcp) { $hinweis = ' - Karte hat eine DHCP-Adresse, darauf bindet der DHCP-Server nicht!' }
+        if ($b.Aktiv) { Write-NetStatus -Status OK -Bereich $b.Karte -Text ('gebunden ({0}){1}' -f $b.IP, $hinweis) }
+        else { Write-NetStatus -Status NA -Bereich $b.Karte -Text ('nicht gebunden ({0}){1}' -f $b.IP, $hinweis) }
+    }
+}
+#
+function Set-NetDhcpBinding {
+    <#
+    .SYNOPSIS
+        Legt fest, auf welchen Netzwerkkarten der DHCP-Server antwortet.
+    #>
+    if (-not (Test-NetDhcpReady)) { return }
+    $bindungen = @(Get-NetSafe -Beschreibung 'Get-DhcpServerv4Binding' -Standard @() -Abfrage { Get-DhcpServerv4Binding } | ForEach-Object {
+            [pscustomobject]@{ Karte = [string]$_.InterfaceAlias; IP = (ConvertTo-NetString -Wert $_.IPAddress); Aktiv = [bool]$_.BindingState }
+        })
+    if ($bindungen.Count -eq 0) { Write-Log -Level Warn -Message 'Keine Netzwerkkarte mit fester IPv4-Adresse fuer DHCP gefunden.'; return }
+    Write-NetText -Text 'Nur Karten im Netz der Clients (bzw. mit DHCP-Relay) sollten gebunden sein. Karten fuer Speicher-, Backup- oder Internetnetze nicht binden.'
+    $wahl = @(Select-NetItem -Elemente $bindungen -Titel 'Welche Karten sollen gebunden sein?' -Eigenschaften @('Karte', 'IP', 'Aktiv') -Mehrfach)
+    if ($wahl.Count -eq 0) { return }
+    $soll = @($wahl | ForEach-Object { $_.Karte })
+    foreach ($b in $bindungen) {
+        $neu = $soll -contains $b.Karte
+        if ($neu -eq $b.Aktiv) { continue }
+        $karte = $b.Karte
+        $alt = $b.Aktiv
+        Invoke-NetChange -Titel ("DHCP-Bindung fuer {0} {1}" -f $karte, $(if ($neu) { 'einschalten' } else { 'ausschalten' })) -Stufe Bestaetigen -Vorher $(if ($alt) { 'gebunden' } else { 'nicht gebunden' }) -Nachher $(if ($neu) { 'gebunden' } else { 'nicht gebunden' }) -BackupBereich @('Dhcp') -Aktion {
+            Set-DhcpServerv4Binding -InterfaceAlias $karte -BindingState $neu
+        } -Rueckgaengig @{ Befehl = 'Set-DhcpServerv4Binding'; Parameter = @{ InterfaceAlias = $karte; BindingState = $alt } } | Out-Null
+    }
+}
+#
+function Set-NetDhcpConflictDetection {
+    <#
+    .SYNOPSIS
+        Konflikterkennung: der Server pingt eine Adresse vor der Vergabe (0 = aus, Vorschlag 1).
+    #>
+    param([Nullable[int]]$Versuche = $null)
+    if (-not (Test-NetDhcpReady)) { return $false }
+    $einst = Get-NetSafe -Beschreibung 'Get-DhcpServerSetting' -Abfrage { Get-DhcpServerSetting }
+    $alt = 0
+    if ($einst) { $alt = [int]$einst.ConflictDetectionAttempts }
+    if ($null -eq $Versuche) {
+        Write-NetText -Text 'Bei eingeschalteter Konflikterkennung pingt der DHCP-Server eine Adresse, bevor er sie vergibt. So werden Doppelvergaben (z. B. Geraete mit fest eingetragener IP) vermieden. Jeder Versuch verzoegert die Vergabe um etwa eine Sekunde. Vorschlag: 1.'
+        $Versuche = Read-NetNumber -Frage ('Anzahl Pingversuche (0-5, aktuell {0})' -f $alt) -Minimum 0 -Maximum 5 -Vorschlag 1
+        if ($null -eq $Versuche) { return $false }
+    }
+    if ($Versuche -eq $alt) { Write-Log -Level OK -Message 'Die Konflikterkennung ist bereits so eingestellt.'; return $true }
+    $neu = [int]$Versuche
+    $r = Invoke-NetChange -Titel 'DHCP-Konflikterkennung einstellen' -Stufe Bestaetigen -Vorher ('{0} Versuch(e)' -f $alt) -Nachher ('{0} Versuch(e)' -f $neu) -BackupBereich @('Dhcp') -Aktion {
+        Set-DhcpServerSetting -ConflictDetectionAttempts $neu
+    } -Rueckgaengig @{ Befehl = 'Set-DhcpServerSetting'; Parameter = @{ ConflictDetectionAttempts = $alt } }
+    return [bool]($r.Erfolg -and -not $r.Probelauf)
+}
+# ----------------------------------------------------------------------
+# src/dhcp/DhcpScope.ps1
+# ----------------------------------------------------------------------
+# DHCP-Scopes: Assistent (Name, Bereich, Maske, Ausschluesse, Lease, 003/006/015),
+# mehrere Netze mit Hinweis auf DHCP-Relay, Superscopes, aktivieren/deaktivieren, loeschen.
+#
+function Get-NetDhcpScopeList {
+    $liste = @()
+    foreach ($s in @(Get-NetSafe -Beschreibung 'Get-DhcpServerv4Scope' -Standard @() -Abfrage { Get-DhcpServerv4Scope })) {
+        if ($null -eq $s) { continue }
+        $maske = ConvertTo-NetString -Wert $s.SubnetMask
+        $liste += [pscustomobject]@{
+            ScopeId    = ConvertTo-NetString -Wert $s.ScopeId
+            Name       = [string]$s.Name
+            Start      = ConvertTo-NetString -Wert $s.StartRange
+            Ende       = ConvertTo-NetString -Wert $s.EndRange
+            Maske      = $maske
+            Prefix     = ConvertTo-NetPrefixLength -SubnetMask $maske
+            Status     = [string]$s.State
+            LeaseTage  = $(if ($s.LeaseDuration -is [TimeSpan]) { [Math]::Round($s.LeaseDuration.TotalDays, 2) } else { 0 })
+            Superscope = [string]$s.SuperscopeName
+        }
+    }
+    return $liste
+}
+#
+function Select-NetDhcpScope {
+    param([string]$Titel = 'Scope waehlen')
+    $liste = @(Get-NetDhcpScopeList)
+    if ($liste.Count -eq 0) { Write-Log -Level Warn -Message 'Es gibt noch keinen Scope. Zuerst einen Scope anlegen.'; return $null }
+    if ($liste.Count -eq 1) { return $liste[0] }
+    return (Select-NetItem -Elemente $liste -Titel $Titel -Eigenschaften @('ScopeId', 'Name', 'Start', 'Ende', 'Status'))
+}
+#
+function Get-NetDhcpScopeOption {
+    <#
+    .SYNOPSIS
+        Liefert die Optionen eines Scopes (oder des Servers ohne ScopeId) als Hashtable OptionId -> Werte.
+    #>
+    param([string]$ScopeId)
+    $ergebnis = @{}
+    $werte = @()
+    if ($ScopeId) { $werte = @(Get-NetSafe -Beschreibung "Optionen $ScopeId" -Standard @() -Abfrage { Get-DhcpServerv4OptionValue -ScopeId $ScopeId }) }
+    else { $werte = @(Get-NetSafe -Beschreibung 'Serveroptionen' -Standard @() -Abfrage { Get-DhcpServerv4OptionValue }) }
+    foreach ($o in $werte) { if ($o) { $ergebnis[[int]$o.OptionId] = @($o.Value | ForEach-Object { [string]$_ }) } }
+    return $ergebnis
+}
+#
+function Show-NetDhcpScope {
+    if (-not (Test-NetDhcpReady)) { return }
+    Write-NetTitle -Titel 'DHCP-Scopes'
+    $liste = @(Get-NetDhcpScopeList)
+    if ($liste.Count -eq 0) { Write-Log -Level Warn -Message 'Keine Scopes vorhanden.'; return }
+    $server = Get-NetDhcpScopeOption
+    foreach ($s in $liste) {
+        $id = $s.ScopeId
+        $stat = Get-NetSafe -Beschreibung "Statistik $id" -Abfrage { Get-DhcpServerv4ScopeStatistics -ScopeId $id }
+        $belegt = ''
+        if ($stat) { $belegt = ('belegt {0:N0}% ({1} frei)' -f [double]$stat.PercentageInUse, $stat.Free) }
+        $farbe = 'Gray'
+        if ($s.Status -ne 'Active') { $farbe = 'DarkGray' }
+        Write-Host ('  {0,-15} {1,-18} {2} - {3} /{4}  {5}  Lease {6} Tage  {7}' -f $id, $s.Name, $s.Start, $s.Ende, $s.Prefix, $s.Status, $s.LeaseTage, $belegt) -ForegroundColor $farbe
+        $opt = Get-NetDhcpScopeOption -ScopeId $id
+        foreach ($nr in @(3, 6, 15)) {
+            $quelle = 'Scope'
+            $wert = $opt[$nr]
+            if (-not $wert -and $server[$nr]) { $wert = $server[$nr]; $quelle = 'Server' }
+            $text = '(fehlt)'
+            if ($wert) { $text = ($wert -join ', ') + ' [' + $quelle + ']' }
+            Write-Host ('      Option {0,3}: {1}' -f $nr, $text)
+        }
+        $aus = @(Get-NetSafe -Beschreibung "Ausschluesse $id" -Standard @() -Abfrage { Get-DhcpServerv4ExclusionRange -ScopeId $id })
+        foreach ($a in $aus) { if ($a) { Write-Host ('      Ausschluss: {0} - {1}' -f (ConvertTo-NetString $a.StartRange), (ConvertTo-NetString $a.EndRange)) } }
+        if ($s.Superscope) { Write-Host ('      Superscope: {0}' -f $s.Superscope) }
+    }
+}
+#
+function Get-NetDhcpRangeSuggestion {
+    <#
+    .SYNOPSIS
+        Schlaegt einen Adressbereich vor: bei /24 .100 bis .199, sonst etwa 40 % bis 80 % des Netzes.
+    #>
+    param([Parameter(Mandatory = $true)][string]$Netz, [Parameter(Mandatory = $true)][int]$Prefix)
+    $basis = [int64](ConvertTo-NetIPv4UInt32 -IPAddress $Netz)
+    $groesse = [int64][Math]::Pow(2, 32 - $Prefix)
+    if ($Prefix -eq 24) { return @((ConvertFrom-NetIPv4UInt32 -Wert ([uint32]($basis + 100))), (ConvertFrom-NetIPv4UInt32 -Wert ([uint32]($basis + 199)))) }
+    $start = $basis + [int64][Math]::Max(1, [Math]::Floor($groesse * 0.4))
+    $ende = $basis + [int64][Math]::Min($groesse - 2, [Math]::Floor($groesse * 0.8))
+    return @((ConvertFrom-NetIPv4UInt32 -Wert ([uint32]$start)), (ConvertFrom-NetIPv4UInt32 -Wert ([uint32]$ende)))
+}
+#
+function Get-NetDcAddress {
+    <#
+    .SYNOPSIS
+        Liefert IPv4-Adressen der DCs (Vorschlag fuer Option 006). Ohne AD: eigene IP, falls DNS laeuft.
+    #>
+    param([hashtable]$Zustand = $script:NS.Zustand)
+    $liste = @()
+    if ($Zustand -and ($Zustand.System.IstDC -or $Zustand.System.IstMitglied) -and (Test-NetCommand -Name 'Get-ADDomainController')) {
+        $liste = @(Get-NetSafe -Beschreibung 'DCs' -Standard @() -Abfrage { Get-ADDomainController -Filter * } | Where-Object { $_ -and $_.IPv4Address } | ForEach-Object { [string]$_.IPv4Address })
+    }
+    if ($liste.Count -eq 0 -and $Zustand -and $Zustand.Dns.Laeuft) { $liste = @($Zustand.Netzwerk.EigeneIPs | Select-Object -First 1) }
+    $eigene = @()
+    if ($Zustand) { $eigene = @($Zustand.Netzwerk.EigeneIPs) }
+    return @(@($liste | Where-Object { $eigene -contains $_ }) + @($liste | Where-Object { $eigene -notcontains $_ }) | Select-Object -Unique)
+}
+#
+function Read-NetExclusionList {
+    <#
+    .SYNOPSIS
+        Fragt Ausschluesse ab ("Start-Ende" oder einzelne Adressen, mit Komma getrennt).
+    #>
+    param([string]$Netz, [int]$Prefix, [string]$Vorschlag = '')
+    $pruefNetz = $Netz
+    $pruefPrefix = $Prefix
+    $text = Read-NetText -Frage 'Ausschluesse (z. B. 192.168.1.100-192.168.1.109, mehrere mit Komma; leer = keine)' -Vorschlag $Vorschlag -LeerErlaubt -Pruefung {
+        param($t)
+        foreach ($teil in $t.Split(',')) {
+            $teil = $teil.Trim()
+            if (-not $teil) { continue }
+            $ab = $teil.Split('-')
+            $a = $ab[0].Trim()
+            $b = $a
+            if ($ab.Count -gt 1) { $b = $ab[1].Trim() }
+            if (-not (Test-NetIPv4Address -Text $a) -or -not (Test-NetIPv4Address -Text $b)) { return "'$teil' ist kein gueltiger Bereich." }
+            if (-not (Test-NetIPInSubnet -IPAddress $a -NetworkAddress $pruefNetz -PrefixLength $pruefPrefix) -or -not (Test-NetIPInSubnet -IPAddress $b -NetworkAddress $pruefNetz -PrefixLength $pruefPrefix)) { return "'$teil' liegt nicht im Netz." }
+            if ((ConvertTo-NetIPv4UInt32 -IPAddress $a) -gt (ConvertTo-NetIPv4UInt32 -IPAddress $b)) { return "In '$teil' ist der Anfang groesser als das Ende." }
+        }
+        return $null
+    }
+    if ($null -eq $text) { return $null }
+    $liste = @()
+    foreach ($teil in $text.Split(',')) {
+        $teil = $teil.Trim()
+        if (-not $teil) { continue }
+        $ab = $teil.Split('-')
+        $a = $ab[0].Trim()
+        $b = $a
+        if ($ab.Count -gt 1) { $b = $ab[1].Trim() }
+        $liste += , @($a, $b)
+    }
+    return , $liste
+}
+#
+function New-NetDhcpScope {
+    <#
+    .SYNOPSIS
+        Scope-Assistent. Ungueltige Bereiche werden vor dem Anlegen abgelehnt; ein vorhandener Scope
+        fuer dasselbe Netz wird erkannt und nicht ueberschrieben.
+    #>
+    param([hashtable]$Vorgaben = @{})
+    if (-not (Test-NetDhcpReady)) { return $false }
+    $z = Get-NetSetupState
+    Write-NetTitle -Titel 'Neuer DHCP-Scope'
+    $karte = @($z.Netzwerk.AktiveKarten) | Select-Object -First 1
+    $netzVorschlag = ''
+    if ($karte) { $a = $karte.Adressen | Select-Object -First 1; $netzVorschlag = '{0}/{1}' -f (Get-NetNetworkAddress -IPAddress $a.IP -PrefixLength $a.Prefix), $a.Prefix }
+    if ($Vorgaben.Netz) { $netzVorschlag = $Vorgaben.Netz }
+    $netz = Read-NetSubnet -Frage 'Netz des Scopes (z. B. 192.168.1.0/24)' -Vorschlag $netzVorschlag
+    if (-not $netz) { return $false }
+    $vorhanden = @(Get-NetDhcpScopeList | Where-Object { $_.ScopeId -eq $netz.Netz })
+    if ($vorhanden.Count -gt 0) {
+        Write-Log -Level OK -Message ('Fuer {0} gibt es schon den Scope "{1}" ({2} - {3}). Er wird nicht ueberschrieben.' -f $netz.Text, $vorhanden[0].Name, $vorhanden[0].Start, $vorhanden[0].Ende)
+        return $true
+    }
+    $eigenesNetz = $false
+    foreach ($k in @($z.Netzwerk.AktiveKarten)) { foreach ($ad in $k.Adressen) { if (Test-NetIPInSubnet -IPAddress $ad.IP -NetworkAddress $netz.Netz -PrefixLength $netz.Prefix) { $eigenesNetz = $true } } }
+    if (-not $eigenesNetz) {
+        Write-Log -Level Warn -Message ('Der Server hat keine Adresse im Netz {0}.' -f $netz.Text)
+        Write-NetText -Text "Fuer ein anderes Netz (VLAN) muss der Router bzw. Layer-3-Switch DHCP-Anfragen an diesen Server weiterleiten`n(DHCP-Relay, oft 'IP Helper' genannt, Ziel = IP dieses Servers). Sonst kommt keine Anfrage an." -Farbe Yellow
+        if (-not (Read-NetYesNo -Frage 'Ist das DHCP-Relay eingerichtet bzw. wird es eingerichtet?' -Vorschlag $true)) { return $false }
+    }
+    $name = Read-NetText -Frage 'Name des Scopes' -Vorschlag $(if ($Vorgaben.Name) { $Vorgaben.Name } elseif ($eigenesNetz) { 'LAN' } else { 'VLAN ' + $netz.Netz })
+    if (-not $name) { return $false }
+    $bereich = Get-NetDhcpRangeSuggestion -Netz $netz.Netz -Prefix $netz.Prefix
+    while ($true) {
+        $start = Read-NetIPAddress -Frage 'Erste Adresse des Bereichs' -Vorschlag $bereich[0] -Netz $netz.Netz -Prefix $netz.Prefix
+        if (-not $start) { return $false }
+        $ende = Read-NetIPAddress -Frage 'Letzte Adresse des Bereichs' -Vorschlag $bereich[1] -Netz $netz.Netz -Prefix $netz.Prefix
+        if (-not $ende) { return $false }
+        $grund = Test-NetIPRange -Start $start -Ende $ende -NetworkAddress $netz.Netz -PrefixLength $netz.Prefix
+        if (-not $grund) { break }
+        Write-Log -Level Fehler -Message $grund
+    }
+    $imBereich = @()
+    foreach ($k in @($z.Netzwerk.AktiveKarten)) {
+        foreach ($ad in $k.Adressen) { if (Test-NetIPInRange -IPAddress $ad.IP -Start $start -Ende $ende) { $imBereich += $ad.IP } }
+        foreach ($g in $k.Gateway) { if (Test-NetIPInRange -IPAddress $g -Start $start -Ende $ende) { $imBereich += $g } }
+    }
+    $ausVorschlag = ''
+    if ($imBereich.Count -gt 0) {
+        Write-Log -Level Warn -Message ('Diese festen Adressen liegen im Bereich und sollten ausgeschlossen werden: ' + ($imBereich -join ', '))
+        $ausVorschlag = ($imBereich | ForEach-Object { $_ }) -join ','
+    }
+    $ausschluesse = Read-NetExclusionList -Netz $netz.Netz -Prefix $netz.Prefix -Vorschlag $ausVorschlag
+    if ($null -eq $ausschluesse) { return $false }
+    $leaseVorschlag = [int](Get-NetConfigValue -Pfad 'Vorschlaege.LeaseTage' -Standard 8)
+    $lease = Read-NetNumber -Frage 'Lease-Dauer in Tagen (Buero: 8, Gaeste/WLAN: 1)' -Minimum 1 -Maximum 999 -Vorschlag $leaseVorschlag
+    if ($null -eq $lease) { return $false }
+    $gwVorschlag = ''
+    if ($karte -and $karte.Gateway.Count -gt 0 -and (Test-NetIPInSubnet -IPAddress $karte.Gateway[0] -NetworkAddress $netz.Netz -PrefixLength $netz.Prefix)) { $gwVorschlag = $karte.Gateway[0] }
+    else { $gwVorschlag = ConvertFrom-NetIPv4UInt32 -Wert ([uint32]((ConvertTo-NetIPv4UInt32 -IPAddress $netz.Netz) + 1)) }
+    $router = Read-NetIPAddress -Frage 'Router / Gateway (Option 003)' -Vorschlag $gwVorschlag -Netz $netz.Netz -Prefix $netz.Prefix
+    if (-not $router) { return $false }
+    if (Test-NetIPInRange -IPAddress $router -Start $start -Ende $ende) {
+        $drin = $false
+        foreach ($a in $ausschluesse) { if (Test-NetIPInRange -IPAddress $router -Start $a[0] -Ende $a[1]) { $drin = $true } }
+        if (-not $drin) { Write-Log -Level Warn -Message 'Der Router liegt im Bereich und ist nicht ausgeschlossen. Er wird automatisch ausgeschlossen.'; $ausschluesse += , @($router, $router) }
+    }
+    $dnsVorschlag = (@(Get-NetDcAddress -Zustand $z) -join ',')
+    $dnsText = Read-NetText -Frage 'DNS-Server fuer die Clients (Option 006, Vorschlag: die DCs)' -Vorschlag $dnsVorschlag -Pruefung {
+        param($t)
+        foreach ($x in $t.Split(',')) { if (-not (Test-NetIPv4Address -Text $x.Trim())) { return "'$x' ist keine gueltige IPv4-Adresse." } }
+        return $null
+    }
+    if (-not $dnsText) { return $false }
+    $dnsServer = @($dnsText.Split(',') | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    if (@($dnsServer | Where-Object { $_ -in @('8.8.8.8', '8.8.4.4', '1.1.1.1', '1.0.0.1', '9.9.9.9') }).Count -gt 0 -and ($z.System.IstDC -or $z.System.IstMitglied)) {
+        Write-Log -Level Warn -Message 'Domaenen-Clients sollten nur die DCs als DNS-Server bekommen, sonst finden sie die Domaene nicht.'
+    }
+    $domVorschlag = Get-NetDomainName
+    $domaene = Read-NetText -Frage 'DNS-Domaene der Clients (Option 015)' -Vorschlag $domVorschlag -LeerErlaubt -Pruefung { param($t) if (-not $t) { $null } else { (Test-NetDomainName -Name $t).Fehler } }
+    if ($null -eq $domaene) { return $false }
+    $aktiv = Read-NetYesNo -Frage 'Scope sofort aktivieren?' -Vorschlag $true
+#
+    $scopeId = $netz.Netz
+    $maske = $netz.Maske
+    $leaseDauer = [TimeSpan]::FromDays($lease)
+    $zustandText = 'InActive'
+    if ($aktiv) { $zustandText = 'Active' }
+    $nachher = @{
+        Name = $name; Netz = $netz.Text; Bereich = "$start - $ende"; Ausschluesse = (($ausschluesse | ForEach-Object { $_[0] + '-' + $_[1] }) -join ', ')
+        'Lease-Dauer' = "$lease Tage"; 'Router (003)' = $router; 'DNS-Server (006)' = ($dnsServer -join ', '); 'Domaene (015)' = $domaene; Status = $zustandText
+    }
+    $r = Invoke-NetChange -Titel ('DHCP-Scope {0} ({1}) anlegen' -f $name, $netz.Text) -Stufe Bestaetigen -Vorher '(kein Scope fuer dieses Netz)' -Nachher $nachher -BackupBereich @('Dhcp') -Aktion {
+        Add-DhcpServerv4Scope -Name $name -StartRange $start -EndRange $ende -SubnetMask $maske -LeaseDuration $leaseDauer -State InActive
+        foreach ($a in $ausschluesse) { Add-DhcpServerv4ExclusionRange -ScopeId $scopeId -StartRange $a[0] -EndRange $a[1] }
+        if ($domaene) { Set-DhcpServerv4OptionValue -ScopeId $scopeId -Router $router -DnsServer $dnsServer -DnsDomain $domaene -Force }
+        else { Set-DhcpServerv4OptionValue -ScopeId $scopeId -Router $router -DnsServer $dnsServer -Force }
+        if ($aktiv) { Set-DhcpServerv4Scope -ScopeId $scopeId -State Active }
+    } -Rueckgaengig @{ Befehl = 'Remove-DhcpServerv4Scope'; Parameter = @{ ScopeId = $scopeId; Force = $true } }
+    return [bool]($r.Erfolg -and -not $r.Probelauf)
+}
+#
+function Add-NetDhcpExclusion {
+    if (-not (Test-NetDhcpReady)) { return }
+    $s = Select-NetDhcpScope -Titel 'Ausschluss fuer welchen Scope?'
+    if (-not $s) { return }
+    $liste = Read-NetExclusionList -Netz $s.ScopeId -Prefix $s.Prefix
+    if (-not $liste -or $liste.Count -eq 0) { return }
+    $vorhanden = @(Get-NetSafe -Beschreibung 'Ausschluesse' -Standard @() -Abfrage { Get-DhcpServerv4ExclusionRange -ScopeId $s.ScopeId } | Where-Object { $_ } | ForEach-Object { (ConvertTo-NetString $_.StartRange) + '-' + (ConvertTo-NetString $_.EndRange) })
+    foreach ($a in $liste) {
+        $text = $a[0] + '-' + $a[1]
+        if ($vorhanden -contains $text) { Write-Log -Level OK -Message "Ausschluss $text existiert bereits."; continue }
+        $id = $s.ScopeId
+        $von = $a[0]
+        $bis = $a[1]
+        Invoke-NetChange -Titel "Ausschluss $text zum Scope $id hinzufuegen" -Stufe Bestaetigen -Vorher ($vorhanden -join ', ') -Nachher (@($vorhanden) + $text -join ', ') -BackupBereich @('Dhcp') -Aktion {
+            Add-DhcpServerv4ExclusionRange -ScopeId $id -StartRange $von -EndRange $bis
+        } -Rueckgaengig @{ Befehl = 'Remove-DhcpServerv4ExclusionRange'; Parameter = @{ ScopeId = $id; StartRange = $von; EndRange = $bis } } | Out-Null
+    }
+}
+#
+function Switch-NetDhcpScopeState {
+    if (-not (Test-NetDhcpReady)) { return }
+    $s = Select-NetDhcpScope -Titel 'Welchen Scope aktivieren/deaktivieren?'
+    if (-not $s) { return }
+    $id = $s.ScopeId
+    $alt = $s.Status
+    $neu = 'Active'
+    if ($alt -eq 'Active') { $neu = 'InActive' }
+    $hinweis = ''
+    if ($neu -eq 'InActive') { $hinweis = 'Ein deaktivierter Scope vergibt keine Adressen mehr. Bestehende Leases laufen weiter, werden aber nicht erneuert.' }
+    Invoke-NetChange -Titel ("Scope {0} {1}" -f $id, $(if ($neu -eq 'Active') { 'aktivieren' } else { 'deaktivieren' })) -Stufe Bestaetigen -Vorher $alt -Nachher $neu -Hinweis $hinweis -BackupBereich @('Dhcp') -Aktion {
+        Set-DhcpServerv4Scope -ScopeId $id -State $neu
+    } -Rueckgaengig @{ Befehl = 'Set-DhcpServerv4Scope'; Parameter = @{ ScopeId = $id; State = $alt } } | Out-Null
+}
+#
+function Remove-NetDhcpScope {
+    if (-not (Test-NetDhcpReady)) { return }
+    $s = Select-NetDhcpScope -Titel 'Welchen Scope loeschen?'
+    if (-not $s) { return }
+    $id = $s.ScopeId
+    $leases = @(Get-NetSafe -Beschreibung 'Leases' -Standard @() -Abfrage { Get-DhcpServerv4Lease -ScopeId $id }).Count
+    Invoke-NetChange -Titel "DHCP-Scope $id ($($s.Name)) loeschen" -Stufe Gefaehrlich -Vorher @{ Scope = $id; Name = $s.Name; Bereich = $s.Start + ' - ' + $s.Ende; Leases = $leases } -Nachher '(geloescht)' -BackupBereich @('Dhcp') `
+        -Hinweis 'Alle Leases, Reservierungen und Optionen des Scopes gehen verloren. Wiederherstellung nur aus dem Backup.' -Aktion {
+        Remove-DhcpServerv4Scope -ScopeId $id -Force
+    } | Out-Null
+}
+#
+function New-NetDhcpSuperscope {
+    <#
+    .SYNOPSIS
+        Fasst Scopes, die im selben physischen Netz liegen, zu einem Superscope zusammen.
+    #>
+    if (-not (Test-NetDhcpReady)) { return }
+    Write-NetText -Text 'Ein Superscope ist nur noetig, wenn mehrere logische Netze auf demselben Kabel/VLAN liegen (z. B. weil das erste Netz voll ist). Fuer getrennte VLANs mit DHCP-Relay braucht man keinen Superscope.'
+    $wahl = @(Select-NetItem -Elemente @(Get-NetDhcpScopeList) -Titel 'Welche Scopes zusammenfassen?' -Eigenschaften @('ScopeId', 'Name', 'Superscope') -Mehrfach)
+    if ($wahl.Count -lt 2) { Write-Log -Level Warn -Message 'Fuer einen Superscope braucht es mindestens zwei Scopes.'; return }
+    $name = Read-NetText -Frage 'Name des Superscopes' -Vorschlag 'Superscope'
+    if (-not $name) { return }
+    $ids = @($wahl | ForEach-Object { $_.ScopeId })
+    Invoke-NetChange -Titel "Superscope $name anlegen" -Stufe Bestaetigen -Vorher (($wahl | ForEach-Object { $_.ScopeId + ' (' + $(if ($_.Superscope) { $_.Superscope } else { 'kein Superscope' }) + ')' }) -join ', ') -Nachher ("$name : " + ($ids -join ', ')) -BackupBereich @('Dhcp') -Aktion {
+        Add-DhcpServerv4Superscope -SuperscopeName $name -ScopeId $ids
+    } -Rueckgaengig @{ Befehl = 'Remove-DhcpServerv4Superscope'; Parameter = @{ SuperscopeName = $name; Force = $true } } | Out-Null
+}
+#
+function Set-NetDhcpStandardOption {
+    <#
+    .SYNOPSIS
+        Aendert Router (003), DNS-Server (006) und Domaene (015) eines Scopes.
+    #>
+    if (-not (Test-NetDhcpReady)) { return }
+    $s = Select-NetDhcpScope -Titel 'Optionen welches Scopes aendern?'
+    if (-not $s) { return }
+    $id = $s.ScopeId
+    $alt = Get-NetDhcpScopeOption -ScopeId $id
+    $router = Read-NetIPAddress -Frage 'Router (003)' -Vorschlag (@($alt[3]) -join '') -Netz $s.ScopeId -Prefix $s.Prefix
+    if (-not $router) { return }
+    $dnsText = Read-NetText -Frage 'DNS-Server (006, mit Komma getrennt)' -Vorschlag $(if ($alt[6]) { $alt[6] -join ',' } else { (@(Get-NetDcAddress -Zustand (Get-NetSetupState)) -join ',') }) -Pruefung {
+        param($t)
+        foreach ($x in $t.Split(',')) { if (-not (Test-NetIPv4Address -Text $x.Trim())) { return "'$x' ist keine gueltige IPv4-Adresse." } }
+        return $null
+    }
+    if (-not $dnsText) { return }
+    $dnsServer = @($dnsText.Split(',') | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    $domaene = Read-NetText -Frage 'Domaene (015)' -Vorschlag $(if ($alt[15]) { $alt[15][0] } else { Get-NetDomainName }) -LeerErlaubt
+    if ($null -eq $domaene) { return }
+    $vorher = @{ '003' = (@($alt[3]) -join ', '); '006' = (@($alt[6]) -join ', '); '015' = (@($alt[15]) -join ', ') }
+    $nachher = @{ '003' = $router; '006' = ($dnsServer -join ', '); '015' = $domaene }
+    if (($vorher['003'] -eq $nachher['003']) -and ($vorher['006'] -eq $nachher['006']) -and ($vorher['015'] -eq $nachher['015'])) { Write-Log -Level OK -Message 'Keine Aenderung.'; return }
+    $rueck = @()
+    foreach ($nr in @(3, 6, 15)) {
+        if ($alt[$nr]) { $rueck += @{ Befehl = 'Set-DhcpServerv4OptionValue'; Parameter = @{ ScopeId = $id; OptionId = $nr; Value = $alt[$nr]; Force = $true } } }
+        else { $rueck += @{ Befehl = 'Remove-DhcpServerv4OptionValue'; Parameter = @{ ScopeId = $id; OptionId = $nr } } }
+    }
+    Invoke-NetChange -Titel "Optionen 003/006/015 des Scopes $id aendern" -Stufe Bestaetigen -Vorher $vorher -Nachher $nachher -BackupBereich @('Dhcp') -Aktion {
+        Set-DhcpServerv4OptionValue -ScopeId $id -Router $router -DnsServer $dnsServer -Force
+        if ($domaene) { Set-DhcpServerv4OptionValue -ScopeId $id -DnsDomain $domaene -Force }
+    } -Rueckgaengig $rueck | Out-Null
+}
+# ----------------------------------------------------------------------
+# src/dhcp/DhcpOptionen.ps1
+# ----------------------------------------------------------------------
+# Zusatzoptionen (standardmaessig aus): NTP (042), PXE (066/067) und DNS-Suchliste (119).
+# Option 119 ist in Windows nicht vordefiniert: sie wird mit Add-DhcpServerv4OptionDefinition
+# angelegt und der Wert nach RFC 3397 kodiert.
+#
+$script:NetZusatzOptionen = @{
+    42  = 'NTP-Server (042): Zeitserver fuer die Clients. Domaenen-Clients holen die Zeit ohnehin vom DC; sinnvoll fuer Geraete ohne Domaene (Drucker, Telefone).'
+    66  = 'PXE-Bootserver (066): Name oder IP des TFTP-Servers fuer Netzwerkboot (z. B. WDS/MDT). Nur noetig, wenn Clients per Netzwerk booten und kein IP-Helper/WDS-Proxy genutzt wird.'
+    67  = 'PXE-Bootdatei (067): Pfad der Bootdatei, z. B. boot\x64\wdsmgfw.efi (UEFI) oder boot\x64\wdsnbp.com (BIOS).'
+    119 = 'DNS-Suchliste (119): weitere Domaenen, die Clients beim Aufloesen kurzer Namen anhaengen. Windows-Clients werten 119 erst ab Windows 10 1803 aus; Linux und macOS nutzen sie.'
+}
+#
+function ConvertTo-NetDhcpSearchList {
+    <#
+    .SYNOPSIS
+        Kodiert eine Liste von Domaenen nach RFC 3397 (DNS-Namen im Wire-Format, ohne Kompression).
+    .OUTPUTS
+        Byte-Array.
+    #>
+    param([Parameter(Mandatory = $true)][string[]]$Domaenen)
+    $bytes = New-Object System.Collections.Generic.List[byte]
+    foreach ($d in $Domaenen) {
+        $name = $d.Trim().TrimEnd('.')
+        if (-not $name) { continue }
+        foreach ($label in $name.Split('.')) {
+            $ascii = [System.Text.Encoding]::ASCII.GetBytes($label.ToLower())
+            if ($ascii.Length -lt 1 -or $ascii.Length -gt 63) { throw "Ungueltiger Teil '$label' in $d." }
+            $bytes.Add([byte]$ascii.Length)
+            foreach ($b in $ascii) { $bytes.Add($b) }
+        }
+        $bytes.Add([byte]0)
+    }
+    if ($bytes.Count -gt 255) { throw 'Die Suchliste ist zu lang (hoechstens 255 Bytes in einer Option).' }
+    return [byte[]]$bytes.ToArray()
+}
+#
+function ConvertFrom-NetDhcpSearchList {
+    <#
+    .SYNOPSIS
+        Dekodiert eine RFC-3397-Suchliste (ohne Kompression) in Domaenennamen.
+    #>
+    param([Parameter(Mandatory = $true)][byte[]]$Bytes)
+    $liste = @()
+    $labels = @()
+    $i = 0
+    while ($i -lt $Bytes.Length) {
+        $laenge = [int]$Bytes[$i]
+        $i++
+        if ($laenge -eq 0) { if ($labels.Count) { $liste += ($labels -join '.') }; $labels = @(); continue }
+        if ($laenge -ge 192) { throw 'Komprimierte Suchlisten werden nicht unterstuetzt.' }
+        $labels += [System.Text.Encoding]::ASCII.GetString($Bytes, $i, $laenge)
+        $i += $laenge
+    }
+    return $liste
+}
+#
+function Install-NetDhcpOption119 {
+    <#
+    .SYNOPSIS
+        Legt die Optionsdefinition 119 an, falls sie fehlt.
+    #>
+    $def = Get-NetSafe -Beschreibung 'Option 119' -Abfrage { Get-DhcpServerv4OptionDefinition -OptionId 119 }
+    if ($def) { return $true }
+    $r = Invoke-NetChange -Titel 'DHCP-Optionsdefinition 119 (DNS-Suchliste) anlegen' -Stufe Bestaetigen -Vorher '(nicht definiert)' -Nachher 'Option 119 "Domain Search List", Typ BinaryData (RFC 3397)' -BackupBereich @('Dhcp') -Aktion {
+        Add-DhcpServerv4OptionDefinition -OptionId 119 -Name 'Domain Search List' -Type BinaryData -Description 'DNS-Suchliste nach RFC 3397 (angelegt von NetSetup)'
+    }
+    return [bool]($r.Erfolg -and -not $r.Probelauf)
+}
+#
+function Set-NetDhcpExtraOption {
+    <#
+    .SYNOPSIS
+        Setzt eine Zusatzoption auf Server- oder Scope-Ebene (042, 066, 067, 119).
+    #>
+    param([ValidateSet(0, 42, 66, 67, 119)][int]$OptionId = 0)
+    if (-not (Test-NetDhcpReady)) { return $false }
+    if ($OptionId -eq 0) {
+        $ids = @(42, 66, 67, 119)
+        $i = Read-NetChoice -Frage 'Welche Zusatzoption?' -Optionen @($ids | ForEach-Object { $script:NetZusatzOptionen[$_] }) -Vorschlag 1
+        if ($i -lt 0) { return $false }
+        $OptionId = $ids[$i]
+    }
+    Write-NetText -Text $script:NetZusatzOptionen[$OptionId]
+    $ebene = Read-NetChoice -Frage 'Fuer wen?' -Optionen @('Alle Scopes (Server-Ebene)', 'Nur einen Scope') -Vorschlag 2
+    if ($ebene -lt 0) { return $false }
+    $scopeId = ''
+    if ($ebene -eq 1) {
+        $s = Select-NetDhcpScope -Titel 'Fuer welchen Scope?'
+        if (-not $s) { return $false }
+        $scopeId = $s.ScopeId
+    }
+    $werte = @()
+    $anzeige = ''
+    switch ($OptionId) {
+        42 {
+            $t = Read-NetText -Frage 'NTP-Server (IPv4, mit Komma getrennt)' -Vorschlag ((@(Get-NetDcAddress -Zustand (Get-NetSetupState))) -join ',') -Pruefung {
+                param($x)
+                foreach ($y in $x.Split(',')) { if (-not (Test-NetIPv4Address -Text $y.Trim())) { return "'$y' ist keine gueltige IPv4-Adresse." } }
+                return $null
+            }
+            if (-not $t) { return $false }
+            $werte = @($t.Split(',') | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+            $anzeige = $werte -join ', '
+        }
+        66 {
+            $t = Read-NetText -Frage 'Name oder IP des Bootservers' -Pruefung { param($x) if ($x -match '^[A-Za-z0-9.-]+$') { $null } else { 'Nur Name oder IP-Adresse.' } }
+            if (-not $t) { return $false }
+            $werte = @($t); $anzeige = $t
+        }
+        67 {
+            $t = Read-NetText -Frage 'Bootdatei' -Vorschlag 'boot\x64\wdsmgfw.efi' -Pruefung { param($x) if ($x -match '^[A-Za-z0-9._\\/-]+$') { $null } else { 'Ungueltige Zeichen im Pfad.' } }
+            if (-not $t) { return $false }
+            $werte = @($t); $anzeige = $t
+        }
+        119 {
+            $t = Read-NetText -Frage 'Domaenen der Suchliste (mit Komma getrennt)' -Vorschlag (Get-NetDomainName) -Pruefung {
+                param($x)
+                foreach ($y in $x.Split(',')) { $e = (Test-NetDomainName -Name $y.Trim()).Fehler; if ($e) { return $e } }
+                return $null
+            }
+            if (-not $t) { return $false }
+            $domaenen = @($t.Split(',') | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+            if (-not (Install-NetDhcpOption119)) { return $false }
+            $werte = @(ConvertTo-NetDhcpSearchList -Domaenen $domaenen | ForEach-Object { [string][int]$_ })
+            $anzeige = ($domaenen -join ', ') + (' ({0} Bytes nach RFC 3397)' -f $werte.Count)
+        }
+    }
+    $alt = Get-NetDhcpScopeOption -ScopeId $scopeId
+    $altWert = $alt[$OptionId]
+    $p = @{ OptionId = $OptionId; Value = $werte; Force = $true }
+    $rp = @{ OptionId = $OptionId }
+    if ($scopeId) { $p.ScopeId = $scopeId; $rp.ScopeId = $scopeId }
+    $rueck = @{ Befehl = 'Remove-DhcpServerv4OptionValue'; Parameter = $rp }
+    if ($altWert) { $rueck = @{ Befehl = 'Set-DhcpServerv4OptionValue'; Parameter = ($rp + @{ Value = $altWert; Force = $true }) } }
+    $r = Invoke-NetChange -Titel ('DHCP-Option {0:000} setzen ({1})' -f $OptionId, $(if ($scopeId) { 'Scope ' + $scopeId } else { 'Server' })) -Stufe Bestaetigen -Vorher $(if ($altWert) { $altWert -join ', ' } else { '(nicht gesetzt)' }) -Nachher $anzeige -BackupBereich @('Dhcp') -Aktion {
+        Set-DhcpServerv4OptionValue @p
+    } -Rueckgaengig $rueck
+    return [bool]($r.Erfolg -and -not $r.Probelauf)
+}
+#
+function Remove-NetDhcpExtraOption {
+    if (-not (Test-NetDhcpReady)) { return }
+    $eintraege = @()
+    foreach ($nr in @(42, 66, 67, 119)) {
+        $server = Get-NetDhcpScopeOption
+        if ($server[$nr]) { $eintraege += [pscustomobject]@{ Ebene = 'Server'; ScopeId = ''; Option = $nr; Wert = ($server[$nr] -join ', ') } }
+    }
+    foreach ($s in @(Get-NetDhcpScopeList)) {
+        $o = Get-NetDhcpScopeOption -ScopeId $s.ScopeId
+        foreach ($nr in @(42, 66, 67, 119)) { if ($o[$nr]) { $eintraege += [pscustomobject]@{ Ebene = 'Scope'; ScopeId = $s.ScopeId; Option = $nr; Wert = ($o[$nr] -join ', ') } } }
+    }
+    $wahl = Select-NetItem -Elemente $eintraege -Titel 'Welche Zusatzoption entfernen?' -Eigenschaften @('Ebene', 'ScopeId', 'Option', 'Wert')
+    if (-not $wahl) { return }
+    $p = @{ OptionId = [int]$wahl.Option }
+    if ($wahl.ScopeId) { $p.ScopeId = $wahl.ScopeId }
+    $altWert = @($wahl.Wert.Split(',') | ForEach-Object { $_.Trim() })
+    Invoke-NetChange -Titel ('DHCP-Option {0:000} entfernen' -f [int]$wahl.Option) -Stufe Bestaetigen -Vorher $wahl.Wert -Nachher '(nicht gesetzt)' -BackupBereich @('Dhcp') -Aktion {
+        Remove-DhcpServerv4OptionValue @p
+    } -Rueckgaengig @{ Befehl = 'Set-DhcpServerv4OptionValue'; Parameter = ($p + @{ Value = $altWert; Force = $true }) } | Out-Null
+}
+#
+function Show-NetDhcpExtraOptionMenu {
+    $eintraege = @(
+        @{ Text = 'Zusatzoption setzen (042, 066, 067, 119)'; Aktion = { Set-NetDhcpExtraOption | Out-Null }; Hilfe = "Alle Zusatzoptionen sind standardmaessig aus und nur bei Bedarf noetig.`n042 NTP-Server, 066/067 PXE-Netzwerkboot, 119 DNS-Suchliste (wird bei Bedarf definiert und nach RFC 3397 kodiert)." },
+        @{ Text = 'Zusatzoption entfernen'; Aktion = 'Remove-NetDhcpExtraOption'; Hilfe = 'Entfernt eine gesetzte Zusatzoption auf Server- oder Scope-Ebene (rueckgaengig moeglich).' }
+    )
+    Show-NetMenu -Titel 'DHCP - Zusatzoptionen' -Eintraege $eintraege
+}
+# ----------------------------------------------------------------------
+# src/dhcp/DhcpReservierung.ps1
+# ----------------------------------------------------------------------
+# Reservierungen (auch aus einem bestehenden Lease in einem Schritt) und Leases.
+#
+function ConvertTo-NetMacAddress {
+    <#
+    .SYNOPSIS
+        Normalisiert eine MAC-Adresse auf aa-bb-cc-dd-ee-ff. Liefert $null bei ungueltiger Eingabe.
+    #>
+    param([AllowEmptyString()][string]$Text)
+    $roh = ($Text -replace '[\s:.-]', '').ToLower()
+    if ($roh -notmatch '^[0-9a-f]{12}$') { return $null }
+    return (($roh -split '(..)' | Where-Object { $_ }) -join '-')
+}
+#
+function Get-NetDhcpLeaseList {
+    param([string]$ScopeId)
+    $scopes = @()
+    if ($ScopeId) { $scopes = @($ScopeId) } else { $scopes = @(Get-NetDhcpScopeList | ForEach-Object { $_.ScopeId }) }
+    $liste = @()
+    foreach ($id in $scopes) {
+        foreach ($l in @(Get-NetSafe -Beschreibung "Leases $id" -Standard @() -Abfrage { Get-DhcpServerv4Lease -ScopeId $id })) {
+            if ($null -eq $l) { continue }
+            $liste += [pscustomobject]@{
+                ScopeId  = $id
+                IP       = ConvertTo-NetString -Wert $l.IPAddress
+                Mac      = [string]$l.ClientId
+                Name     = [string]$l.HostName
+                Status   = [string]$l.AddressState
+                Ablauf   = $l.LeaseExpiryTime
+            }
+        }
+    }
+    return $liste
+}
+#
+function Test-NetDhcpReservation {
+    <#
+    .SYNOPSIS
+        Prueft eine geplante Reservierung: im Scope-Bereich, nicht im Ausschluss, nicht belegt.
+        Liefert eine Liste von Problemen (leer = in Ordnung).
+    #>
+    param(
+        [Parameter(Mandatory = $true)][object]$Scope,
+        [Parameter(Mandatory = $true)][string]$IPAddress,
+        [Parameter(Mandatory = $true)][string]$Mac,
+        [object[]]$Ausschluesse = $null,
+        [object[]]$Reservierungen = $null,
+        [object[]]$Leases = $null
+    )
+    $probleme = @()
+    $id = $Scope.ScopeId
+    if (-not (Test-NetIPInRange -IPAddress $IPAddress -Start $Scope.Start -Ende $Scope.Ende)) {
+        $probleme += ('{0} liegt nicht im Bereich des Scopes ({1} - {2}).' -f $IPAddress, $Scope.Start, $Scope.Ende)
+    }
+    if ($null -eq $Ausschluesse) { $Ausschluesse = @(Get-NetSafe -Beschreibung 'Ausschluesse' -Standard @() -Abfrage { Get-DhcpServerv4ExclusionRange -ScopeId $id }) }
+    foreach ($a in @($Ausschluesse | Where-Object { $_ })) {
+        if (Test-NetIPInRange -IPAddress $IPAddress -Start (ConvertTo-NetString $a.StartRange) -Ende (ConvertTo-NetString $a.EndRange)) {
+            $probleme += ('{0} liegt in einem Ausschluss ({1} - {2}).' -f $IPAddress, (ConvertTo-NetString $a.StartRange), (ConvertTo-NetString $a.EndRange))
+        }
+    }
+    if ($null -eq $Reservierungen) { $Reservierungen = @(Get-NetSafe -Beschreibung 'Reservierungen' -Standard @() -Abfrage { Get-DhcpServerv4Reservation -ScopeId $id }) }
+    foreach ($r in @($Reservierungen | Where-Object { $_ })) {
+        $rIp = ConvertTo-NetString $r.IPAddress
+        $rMac = ConvertTo-NetMacAddress -Text ([string]$r.ClientId)
+        if ($rIp -eq $IPAddress -and $rMac -ne $Mac) { $probleme += ('{0} ist schon fuer {1} ({2}) reserviert.' -f $IPAddress, $rMac, $r.Name) }
+        if ($rMac -eq $Mac -and $rIp -ne $IPAddress) { $probleme += ('Dieses Geraet ({0}) hat schon die Reservierung {1}.' -f $Mac, $rIp) }
+    }
+    if ($null -eq $Leases) { $Leases = @(Get-NetSafe -Beschreibung 'Leases' -Standard @() -Abfrage { Get-DhcpServerv4Lease -ScopeId $id }) }
+    foreach ($l in @($Leases | Where-Object { $_ })) {
+        $lIp = ConvertTo-NetString $l.IPAddress
+        $lMac = ConvertTo-NetMacAddress -Text ([string]$l.ClientId)
+        if ($lIp -eq $IPAddress -and $lMac -and $lMac -ne $Mac) { $probleme += ('{0} ist zurzeit an ein anderes Geraet vergeben ({1}, {2}).' -f $IPAddress, $lMac, $l.HostName) }
+    }
+    return $probleme
+}
+#
+function Add-NetDhcpReservation {
+    <#
+    .SYNOPSIS
+        Reservierung anlegen (mit Pruefung), optional mit DNS-Eintrag.
+    #>
+    param([object]$Scope, [string]$IPAddress, [string]$Mac, [string]$Name, [string]$Beschreibung = '', [switch]$OhneDnsFrage)
+    if (-not (Test-NetDhcpReady)) { return $false }
+    if (-not $Scope) { $Scope = Select-NetDhcpScope -Titel 'Reservierung in welchem Scope?' }
+    if (-not $Scope) { return $false }
+    if (-not $Mac) {
+        $Mac = Read-NetText -Frage 'MAC-Adresse des Geraets (z. B. 00-15-5D-01-02-03)' -Pruefung { param($t) if (ConvertTo-NetMacAddress -Text $t) { $null } else { 'Bitte 12 Hex-Zeichen eingeben, z. B. 00-15-5D-01-02-03.' } }
+        if (-not $Mac) { return $false }
+    }
+    $Mac = ConvertTo-NetMacAddress -Text $Mac
+    if (-not $Mac) { Write-Log -Level Fehler -Message 'Ungueltige MAC-Adresse.'; return $false }
+    if (-not $IPAddress) {
+        $IPAddress = Read-NetIPAddress -Frage 'Reservierte IP-Adresse' -Netz $Scope.ScopeId -Prefix $Scope.Prefix
+        if (-not $IPAddress) { return $false }
+    }
+    if (-not $Name) {
+        $Name = Read-NetText -Frage 'Name des Geraets (z. B. drucker-buero)' -Pruefung { param($t) Test-NetDnsRecordName -Name $t }
+        if (-not $Name) { return $false }
+    }
+    $id = $Scope.ScopeId
+    $vorhanden = @(Get-NetSafe -Beschreibung 'Reservierungen' -Standard @() -Abfrage { Get-DhcpServerv4Reservation -ScopeId $id })
+    $gleich = @($vorhanden | Where-Object { $_ -and (ConvertTo-NetString $_.IPAddress) -eq $IPAddress -and (ConvertTo-NetMacAddress -Text ([string]$_.ClientId)) -eq $Mac })
+    if ($gleich.Count -gt 0) { Write-Log -Level OK -Message "Die Reservierung $IPAddress fuer $Mac existiert bereits. Nichts zu tun."; return $true }
+    $probleme = @(Test-NetDhcpReservation -Scope $Scope -IPAddress $IPAddress -Mac $Mac -Reservierungen $vorhanden)
+    if ($probleme.Count -gt 0) {
+        foreach ($p in $probleme) { Write-Log -Level Fehler -Message $p }
+        Write-Log -Message 'Naechster Schritt: eine andere Adresse waehlen bzw. den Konflikt beheben. Die Reservierung wird nicht angelegt.'
+        return $false
+    }
+    $ip = $IPAddress
+    $mac = $Mac
+    $geraet = $Name
+    $text = $Beschreibung
+    $r = Invoke-NetChange -Titel "Reservierung $ip fuer $geraet anlegen" -Stufe Bestaetigen -Vorher '(keine Reservierung)' -Nachher @{ Scope = $id; IP = $ip; MAC = $mac; Name = $geraet } -BackupBereich @('Dhcp') -Aktion {
+        Add-DhcpServerv4Reservation -ScopeId $id -IPAddress $ip -ClientId $mac -Name $geraet -Description $text
+    } -Rueckgaengig @{ Befehl = 'Remove-DhcpServerv4Reservation'; Parameter = @{ IPAddress = $ip } }
+    $ok = [bool]($r.Erfolg -and -not $r.Probelauf)
+    if ($ok -and -not $OhneDnsFrage -and (Test-NetCommand -Name 'Add-NetDnsRecord') -and (Test-NetDnsReady -Still)) {
+        $zone = Get-NetDomainName
+        if ($zone -and (Read-NetYesNo -Frage ("Passenden DNS-Eintrag {0}.{1} -> {2} (mit PTR) anlegen?" -f $geraet, $zone, $ip) -Vorschlag $true)) {
+            Add-NetDnsRecord -Zone $zone -Name $geraet -Typ A -Daten @{ IPv4Address = $ip } -MitPtr $true | Out-Null
+        }
+    }
+    return $ok
+}
+#
+function Add-NetDhcpReservationFromLease {
+    <#
+    .SYNOPSIS
+        Macht aus einem bestehenden Lease in einem Schritt eine Reservierung.
+    #>
+    if (-not (Test-NetDhcpReady)) { return $false }
+    $leases = @(Get-NetDhcpLeaseList | Where-Object { $_.Status -like 'Active*' -and $_.Status -notlike '*Reservation*' })
+    if ($leases.Count -eq 0) { Write-Log -Level Warn -Message 'Es gibt keine aktiven Leases ohne Reservierung.'; return $false }
+    $l = Select-NetItem -Elemente $leases -Titel 'Welches Geraet soll seine Adresse behalten?' -Eigenschaften @('IP', 'Mac', 'Name', 'ScopeId')
+    if (-not $l) { return $false }
+    $scope = @(Get-NetDhcpScopeList | Where-Object { $_.ScopeId -eq $l.ScopeId }) | Select-Object -First 1
+    $name = ([string]$l.Name).Split('.')[0]
+    if (-not $name) { $name = 'geraet-' + ($l.IP -replace '\.', '-') }
+    return (Add-NetDhcpReservation -Scope $scope -IPAddress $l.IP -Mac $l.Mac -Name $name -Beschreibung 'aus Lease uebernommen (NetSetup)' -OhneDnsFrage)
+}
+#
+function Show-NetDhcpReservation {
+    if (-not (Test-NetDhcpReady)) { return }
+    Write-NetTitle -Titel 'Reservierungen'
+    foreach ($s in @(Get-NetDhcpScopeList)) {
+        $id = $s.ScopeId
+        $liste = @(Get-NetSafe -Beschreibung 'Reservierungen' -Standard @() -Abfrage { Get-DhcpServerv4Reservation -ScopeId $id })
+        Write-Host ('  Scope {0} ({1}): {2} Reservierung(en)' -f $id, $s.Name, @($liste | Where-Object { $_ }).Count) -ForegroundColor White
+        foreach ($r in @($liste | Where-Object { $_ })) {
+            $ip = ConvertTo-NetString $r.IPAddress
+            $warn = ''
+            if (-not (Test-NetIPInRange -IPAddress $ip -Start $s.Start -Ende $s.Ende)) { $warn = '  [WARN] ausserhalb des Bereichs' }
+            Write-Host ('    {0,-15} {1,-18} {2}{3}' -f $ip, $r.ClientId, $r.Name, $warn)
+        }
+    }
+}
+#
+function Remove-NetDhcpReservation {
+    if (-not (Test-NetDhcpReady)) { return }
+    $alle = @()
+    foreach ($s in @(Get-NetDhcpScopeList)) {
+        $id = $s.ScopeId
+        foreach ($r in @(Get-NetSafe -Beschreibung 'Reservierungen' -Standard @() -Abfrage { Get-DhcpServerv4Reservation -ScopeId $id })) {
+            if ($r) { $alle += [pscustomobject]@{ ScopeId = $id; IP = (ConvertTo-NetString $r.IPAddress); Mac = [string]$r.ClientId; Name = [string]$r.Name; Beschreibung = [string]$r.Description } }
+        }
+    }
+    $w = Select-NetItem -Elemente $alle -Titel 'Welche Reservierung loeschen?' -Eigenschaften @('ScopeId', 'IP', 'Mac', 'Name')
+    if (-not $w) { return }
+    $ip = $w.IP
+    Invoke-NetChange -Titel "Reservierung $ip ($($w.Name)) loeschen" -Stufe Bestaetigen -Vorher ('{0} {1} {2}' -f $w.IP, $w.Mac, $w.Name) -Nachher '(geloescht)' -BackupBereich @('Dhcp') -Aktion {
+        Remove-DhcpServerv4Reservation -IPAddress $ip
+    } -Rueckgaengig @{ Befehl = 'Add-DhcpServerv4Reservation'; Parameter = @{ ScopeId = $w.ScopeId; IPAddress = $w.IP; ClientId = $w.Mac; Name = $w.Name; Description = $w.Beschreibung } } | Out-Null
+}
+#
+function Show-NetDhcpLease {
+    param([string]$Suche)
+    if (-not (Test-NetDhcpReady)) { return }
+    $liste = @(Get-NetDhcpLeaseList)
+    if ($Suche) { $liste = @($liste | Where-Object { $_.IP -like "*$Suche*" -or $_.Mac -like "*$Suche*" -or $_.Name -like "*$Suche*" }) }
+    Write-NetTitle -Titel ('Leases ({0})' -f $liste.Count)
+    foreach ($l in ($liste | Sort-Object -Property { ConvertTo-NetIPv4UInt32 -IPAddress $_.IP })) {
+        Write-Host ('  {0,-15} {1,-18} {2,-30} {3,-18} bis {4}' -f $l.IP, $l.Mac, $l.Name, $l.Status, $l.Ablauf)
+    }
+}
+#
+function Find-NetDhcpLease {
+    $s = Read-NetText -Frage 'Suchbegriff (Teil von IP, MAC oder Name)'
+    if ($s) { Show-NetDhcpLease -Suche $s }
+}
+#
+function Remove-NetDhcpLease {
+    if (-not (Test-NetDhcpReady)) { return }
+    $l = Select-NetItem -Elemente @(Get-NetDhcpLeaseList) -Titel 'Welches Lease loeschen?' -Eigenschaften @('IP', 'Mac', 'Name', 'Status')
+    if (-not $l) { return }
+    $ip = $l.IP
+    Invoke-NetChange -Titel "Lease $ip ($($l.Name)) loeschen" -Stufe Bestaetigen -Vorher ('{0} {1} {2}' -f $l.IP, $l.Mac, $l.Name) -Nachher '(geloescht - das Geraet bekommt beim naechsten Erneuern eine neue Adresse)' -BackupBereich @('Dhcp') -Aktion {
+        Remove-DhcpServerv4Lease -IPAddress $ip
+    } | Out-Null
+}
+#
+function Show-NetDhcpReservationMenu {
+    $eintraege = @(
+        @{ Text = 'Reservierungen anzeigen'; Aktion = 'Show-NetDhcpReservation'; Hilfe = 'Alle Reservierungen pro Scope; Reservierungen ausserhalb des Bereichs werden markiert.' },
+        @{ Text = 'Reservierung anlegen'; Aktion = { Add-NetDhcpReservation | Out-Null }; Hilfe = "Feste Adresse fuer ein Geraet (MAC). Vorher wird geprueft: im Bereich, nicht im Ausschluss, nicht an ein anderes Geraet vergeben.`nAuf Wunsch wird gleich der DNS-Eintrag (A + PTR) angelegt." },
+        @{ Text = 'Reservierung aus bestehendem Lease'; Aktion = { Add-NetDhcpReservationFromLease | Out-Null }; Hilfe = 'Ein Geraet behaelt seine aktuelle Adresse dauerhaft - in einem Schritt.' },
+        @{ Text = 'Reservierung loeschen'; Aktion = 'Remove-NetDhcpReservation'; Hilfe = 'Loescht eine Reservierung (rueckgaengig moeglich).' },
+        @{ Text = 'Leases anzeigen'; Aktion = { Show-NetDhcpLease }; Hilfe = 'Alle vergebenen Adressen mit MAC, Name, Status und Ablauf.' },
+        @{ Text = 'Lease suchen'; Aktion = 'Find-NetDhcpLease'; Hilfe = 'Sucht nach Teil von IP, MAC oder Name.' },
+        @{ Text = 'Lease loeschen'; Aktion = 'Remove-NetDhcpLease'; Hilfe = 'Gibt eine Adresse frei. Das Geraet holt sich beim naechsten Erneuern eine neue Adresse.' },
+        @{ Text = 'Konflikterkennung einstellen'; Aktion = { Set-NetDhcpConflictDetection | Out-Null }; Hilfe = 'Der Server pingt eine Adresse vor der Vergabe (Vorschlag: 1 Versuch), um Doppelvergaben zu vermeiden.' }
+    )
+    Show-NetMenu -Titel 'DHCP - Reservierungen und Leases' -Eintraege $eintraege
+}
+# ----------------------------------------------------------------------
+# src/dhcp/DhcpFailover.ps1
+# ----------------------------------------------------------------------
+# DHCP-Failover: Partner pruefen (Rolle, autorisiert, erreichbar), Lastverteilung oder Reserve,
+# gemeinsames Geheimnis verdeckt, Status anzeigen, Replikation ausloesen.
+#
+function Test-NetTcpPort {
+    <#
+    .SYNOPSIS
+        Prueft, ob ein TCP-Port erreichbar ist (nur .NET-Bordmittel, mit Zeitlimit).
+    #>
+    param([Parameter(Mandatory = $true)][string]$Ziel, [Parameter(Mandatory = $true)][int]$Port, [int]$TimeoutMs = 2000)
+    $client = New-Object System.Net.Sockets.TcpClient
+    try {
+        $ar = $client.BeginConnect($Ziel, $Port, $null, $null)
+        if (-not $ar.AsyncWaitHandle.WaitOne($TimeoutMs, $false)) { return $false }
+        $client.EndConnect($ar)
+        return $true
+    }
+    catch { return $false }
+    finally { $client.Close() }
+}
+#
+function Test-NetDhcpFailoverPartner {
+    <#
+    .SYNOPSIS
+        Prueft den Failover-Partner. Liefert eine Liste von Problemen (leer = bereit).
+    #>
+    param([Parameter(Mandatory = $true)][string]$Partner)
+    $probleme = @()
+    $aufgeloest = Get-NetSafe -Beschreibung "Aufloesung $Partner" -Abfrage { Resolve-DnsName -Name $Partner -Type A -DnsOnly -QuickTimeout }
+    if (-not $aufgeloest) { $probleme += "Der Name $Partner laesst sich im DNS nicht aufloesen." }
+    if (-not (Test-NetTcpPort -Ziel $Partner -Port 647)) { $probleme += "$Partner ist auf TCP-Port 647 (DHCP-Failover) nicht erreichbar: DHCP-Dienst aus, Firewall oder falscher Name." }
+    $einst = Get-NetSafe -Beschreibung "DHCP auf $Partner" -Abfrage { Get-DhcpServerSetting -ComputerName $Partner }
+    if (-not $einst) { $probleme += "Auf $Partner ist kein DHCP-Server erreichbar (Rolle fehlt oder keine Rechte)." }
+    elseif ($einst.IsDomainJoined -and -not $einst.IsAuthorized) { $probleme += "$Partner ist nicht im AD autorisiert." }
+    return $probleme
+}
+#
+function Show-NetDhcpFailover {
+    if (-not (Test-NetDhcpReady)) { return }
+    Write-NetTitle -Titel 'DHCP-Failover'
+    $liste = @(Get-NetSafe -Beschreibung 'Get-DhcpServerv4Failover' -Standard @() -Abfrage { Get-DhcpServerv4Failover })
+    if (@($liste | Where-Object { $_ }).Count -eq 0) { Write-Log -Message 'Kein Failover eingerichtet.'; return }
+    foreach ($f in @($liste | Where-Object { $_ })) {
+        $status = 'OK'
+        if ([string]$f.State -ne 'Normal') { $status = 'WARN' }
+        Write-NetStatus -Status $status -Bereich ([string]$f.Name) -Text ('Partner {0}, Modus {1}, Zustand {2}, Scopes {3}' -f $f.PartnerServer, $f.Mode, $f.State, ((@($f.ScopeId) | ForEach-Object { ConvertTo-NetString $_ }) -join ', '))
+    }
+}
+#
+function New-NetDhcpFailover {
+    <#
+    .SYNOPSIS
+        Failover-Assistent. Bricht sauber ab, wenn der Partner nicht bereit ist.
+    #>
+    if (-not (Test-NetDhcpReady)) { return $false }
+    Write-NetTitle -Titel 'DHCP-Failover einrichten'
+    Write-NetText -Text "Zwei DHCP-Server teilen sich Scopes. Lastverteilung: beide vergeben je die Haelfte. Reserve (Hot-Standby): einer arbeitet,`nder andere haelt einige Prozent zurueck und uebernimmt bei Ausfall. Der Partner braucht die DHCP-Rolle, muss autorisiert und ueber TCP 647 erreichbar sein."
+    $partner = Read-NetText -Frage 'Name des Partner-DHCP-Servers (z. B. dc02.ad.firma.ch)' -Pruefung { param($t) if ($t -match '^[A-Za-z0-9.-]+$') { $null } else { 'Ungueltiger Name.' } }
+    if (-not $partner) { return $false }
+    Write-Log -Message "Pruefe den Partner $partner ..."
+    $probleme = @(Test-NetDhcpFailoverPartner -Partner $partner)
+    if ($probleme.Count -gt 0) {
+        foreach ($p in $probleme) { Write-Log -Level Fehler -Message $p }
+        Write-Log -Message 'Der Partner ist nicht bereit. Es wurde nichts geaendert. Naechster Schritt: auf dem Partner NetSetup ausfuehren (DHCP-Rolle installieren, autorisieren) und Firewall pruefen.'
+        return $false
+    }
+    Write-Log -Level OK -Message "Der Partner $partner ist bereit."
+    $vorhanden = @(Get-NetSafe -Beschreibung 'Failover' -Standard @() -Abfrage { Get-DhcpServerv4Failover } | Where-Object { $_ } | ForEach-Object { @($_.ScopeId | ForEach-Object { ConvertTo-NetString $_ }) })
+    $frei = @(Get-NetDhcpScopeList | Where-Object { $vorhanden -notcontains $_.ScopeId })
+    if ($frei.Count -eq 0) { Write-Log -Level Warn -Message 'Alle Scopes sind bereits in einer Failover-Beziehung (oder es gibt keine).'; return $false }
+    $wahl = @(Select-NetItem -Elemente $frei -Titel 'Welche Scopes sollen ausfallsicher werden?' -Eigenschaften @('ScopeId', 'Name', 'Start', 'Ende') -Mehrfach)
+    if ($wahl.Count -eq 0) { return $false }
+    $modus = Read-NetChoice -Frage 'Modus' -Optionen @('Lastverteilung 50/50 (empfohlen)', 'Reserve / Hot-Standby (dieser Server aktiv, Partner haelt 5 % zurueck)') -Vorschlag 1
+    if ($modus -lt 0) { return $false }
+    Write-NetText -Text 'Das gemeinsame Geheimnis sichert die Verbindung der beiden Server. Es wird nicht gespeichert.'
+    $geheim = Read-NetSecret -Frage 'Gemeinsames Geheimnis' -Bestaetigen -MinLaenge 8
+    if (-not $geheim) { return $false }
+    $name = Read-NetText -Frage 'Name der Failover-Beziehung' -Vorschlag (('{0}-{1}' -f [Environment]::MachineName, $partner.Split('.')[0]).ToUpper())
+    if (-not $name) { return $false }
+    $ids = @($wahl | ForEach-Object { $_.ScopeId })
+    $art = 'Lastverteilung 50 %'
+    if ($modus -eq 1) { $art = 'Reserve (Hot-Standby), 5 % Reserve' }
+    $r = Invoke-NetChange -Titel "DHCP-Failover $name mit $partner einrichten" -Stufe Bestaetigen -Vorher '(kein Failover)' -Nachher @{ Name = $name; Partner = $partner; Modus = $art; Scopes = ($ids -join ', '); Geheimnis = '(verdeckt)' } -BackupBereich @('Dhcp') -Aktion {
+        $klar = ConvertFrom-NetSecureString -Geheim $geheim
+        try {
+            if ($modus -eq 0) { Add-DhcpServerv4Failover -Name $name -PartnerServer $partner -ScopeId $ids -LoadBalancePercent 50 -SharedSecret $klar -Force }
+            else { Add-DhcpServerv4Failover -Name $name -PartnerServer $partner -ScopeId $ids -ServerRole Active -ReservePercent 5 -SharedSecret $klar -Force }
+        }
+        finally { $klar = $null }
+    } -Rueckgaengig @{ Befehl = 'Remove-DhcpServerv4Failover'; Parameter = @{ Name = $name; Force = $true } }
+    return [bool]($r.Erfolg -and -not $r.Probelauf)
+}
+#
+function Sync-NetDhcpFailover {
+    <#
+    .SYNOPSIS
+        Repliziert die Scope-Einstellungen zum Partner (Optionen, Reservierungen, Ausschluesse).
+    #>
+    if (-not (Test-NetDhcpReady)) { return }
+    $liste = @(Get-NetSafe -Beschreibung 'Failover' -Standard @() -Abfrage { Get-DhcpServerv4Failover } | Where-Object { $_ } | ForEach-Object { [pscustomobject]@{ Name = [string]$_.Name; Partner = [string]$_.PartnerServer; Zustand = [string]$_.State } })
+    $f = Select-NetItem -Elemente $liste -Titel 'Welche Failover-Beziehung replizieren?' -Eigenschaften @('Name', 'Partner', 'Zustand')
+    if (-not $f) { return }
+    $name = $f.Name
+    Invoke-NetChange -Titel "Einstellungen von $name zum Partner replizieren" -Stufe Bestaetigen -Vorher 'Partner hat evtl. veraltete Einstellungen' -Nachher 'Partner hat die Einstellungen dieses Servers' -Hinweis 'Die Einstellungen dieses Servers ueberschreiben die des Partners fuer die betroffenen Scopes.' -BackupBereich @('Dhcp') -Aktion {
+        Invoke-DhcpServerv4FailoverReplication -Name $name -Force | Out-Null
+    } | Out-Null
+}
+#
+function Show-NetDhcpFailoverMenu {
+    $eintraege = @(
+        @{ Text = 'Status anzeigen'; Aktion = 'Show-NetDhcpFailover'; Hilfe = 'Zeigt alle Failover-Beziehungen mit Partner, Modus, Zustand (Normal = in Ordnung) und Scopes.' },
+        @{ Text = 'Failover einrichten (Assistent)'; Aktion = { New-NetDhcpFailover | Out-Null }; Hilfe = "Prueft zuerst den Partner (Name, TCP 647, DHCP-Rolle, Autorisierung) und bricht sauber ab, wenn er nicht bereit ist.`nDann Lastverteilung oder Reserve waehlen und ein gemeinsames Geheimnis verdeckt eingeben." },
+        @{ Text = 'Replikation ausloesen'; Aktion = 'Sync-NetDhcpFailover'; Hilfe = 'Nach Aenderungen an Optionen, Reservierungen oder Ausschluessen: Einstellungen zum Partner uebertragen.' }
+    )
+    Show-NetMenu -Titel 'DHCP - Failover' -Eintraege $eintraege
+}
+# ----------------------------------------------------------------------
+# src/dhcp/DhcpMenue.ps1
+# ----------------------------------------------------------------------
+# DHCP: Uebersicht, Einrichtungs-Assistent und Menue.
+#
+function Show-NetDhcpOverview {
+    if (-not (Test-NetDhcpReady)) { return }
+    $z = Get-NetSetupState
+    Write-NetTitle -Titel 'DHCP-Uebersicht'
+    $auth = Test-NetDhcpAuthorized
+    if ($null -eq $auth) { Write-NetStatus -Status NA -Bereich 'Autorisierung' -Text 'keine Domaene - nicht noetig' }
+    elseif ($auth) { Write-NetStatus -Status OK -Bereich 'Autorisierung' -Text 'im AD autorisiert' }
+    else { Write-NetStatus -Status FEHLER -Bereich 'Autorisierung' -Text 'NICHT autorisiert - der Server vergibt keine Adressen' }
+    if ($z.Dhcp.Nachkonfiguriert) { Write-NetStatus -Status OK -Bereich 'Nachkonfiguration' -Text 'erledigt' }
+    else { Write-NetStatus -Status WARN -Bereich 'Nachkonfiguration' -Text 'fehlt (Server-Manager meldet "Konfiguration erforderlich")' }
+    Write-NetStatus -Status INFO -Bereich 'Konflikterkennung' -Text ('{0} Versuch(e)' -f $z.Dhcp.KonfliktErkennung)
+    Show-NetDhcpScope
+    if (@($z.Dhcp.Failover).Count -gt 0) { Show-NetDhcpFailover }
+}
+#
+function Start-NetDhcpSetup {
+    <#
+    .SYNOPSIS
+        Assistent: Rolle, Nachkonfiguration, Autorisierung, Bindungen, erster Scope, Optionen.
+        Ueberspringt alles, was schon passt.
+    #>
+    Write-NetTitle -Titel 'DHCP einrichten'
+    $z = Get-NetSetupState
+    $andererServer = @($z.Netzwerk.AktiveKarten | Where-Object { $_.Dhcp })
+    if ($andererServer.Count -gt 0) {
+        Write-Log -Level Warn -Message 'Dieser Server bezieht seine eigene Adresse per DHCP. Ein DHCP-Server braucht eine feste IP (sonst bindet er nicht).'
+        if (Read-NetYesNo -Frage 'Jetzt eine feste IP setzen?' -Vorschlag $true) { Set-NetStaticAddress -Karte $andererServer[0] | Out-Null }
+    }
+    if (-not ($z.Dhcp.Installiert -and $z.Dhcp.Tools)) {
+        if (-not (Install-NetDhcpRole)) { return }
+    }
+    elseif (-not $z.Dhcp.Nachkonfiguriert) { Complete-NetDhcpPostInstall | Out-Null }
+    else { Write-Log -Level OK -Message 'DHCP-Rolle installiert und nachkonfiguriert.' }
+    if (-not (Test-NetDhcpReady)) { return }
+    $auth = Test-NetDhcpAuthorized
+    if ($auth -eq $false) { Add-NetDhcpAuthorization | Out-Null }
+    elseif ($null -eq $auth) { Write-Log -Message 'Keine Domaene: Autorisierung nicht noetig.' }
+    else { Write-Log -Level OK -Message 'Im AD autorisiert.' }
+    $z = Get-NetSetupState
+    if (@($z.Dhcp.Bindungen | Where-Object { $_.Aktiv }).Count -eq 0 -and @($z.Dhcp.Bindungen).Count -gt 0) {
+        Write-Log -Level Warn -Message 'Der DHCP-Server ist an keine Netzwerkkarte gebunden.'
+        Set-NetDhcpBinding
+    }
+    if (@($z.Dhcp.Scopes).Count -eq 0) {
+        Write-Log -Message 'Es gibt noch keinen Scope. Der Scope-Assistent startet.'
+        New-NetDhcpScope | Out-Null
+    }
+    else {
+        Write-Log -Level OK -Message (('{0} Scope(s) vorhanden: ' -f @($z.Dhcp.Scopes).Count) + (($z.Dhcp.Scopes | ForEach-Object { $_.ScopeId }) -join ', '))
+        foreach ($s in @($z.Dhcp.Scopes)) {
+            $fehlt = @(@('3', '6', '15') | Where-Object { -not $s.Optionen.ContainsKey($_) -and -not $z.Dhcp.ServerOptionen.ContainsKey($_) })
+            if ($fehlt.Count -gt 0) { Write-Log -Level Warn -Message ('Im Scope {0} fehlen die Optionen {1}. Im Menue Scopes -> Optionen 003/006/015 ergaenzen.' -f $s.ScopeId, ($fehlt -join ', ')) }
+            if (-not $s.Aktiv) { Write-Log -Level Warn -Message ('Der Scope {0} ist nicht aktiv.' -f $s.ScopeId) }
+        }
+        if (Read-NetYesNo -Frage 'Einen weiteren Scope (z. B. fuer ein anderes VLAN) anlegen?' -Vorschlag $false) { New-NetDhcpScope | Out-Null }
+    }
+    if ($z.Dhcp.KonfliktErkennung -eq 0 -and (Read-NetYesNo -Frage 'Konflikterkennung einschalten (1 Ping vor jeder Vergabe)?' -Vorschlag $true)) {
+        Set-NetDhcpConflictDetection -Versuche 1 | Out-Null
+    }
+    Write-Log -Level OK -Message 'DHCP-Einrichtung abgeschlossen.'
+}
+#
+function Show-NetDhcpScopeMenu {
+    $eintraege = @(
+        @{ Text = 'Scopes anzeigen'; Aktion = 'Show-NetDhcpScope'; Hilfe = 'Alle Scopes mit Bereich, Status, Lease-Dauer, Auslastung, Optionen 003/006/015 und Ausschluessen.' },
+        @{ Text = 'Neuer Scope (Assistent)'; Aktion = { New-NetDhcpScope | Out-Null }; Hilfe = "Name, Netz, Bereich, Ausschluesse, Lease-Dauer (Vorschlag 8 Tage), Router (003), DNS-Server (006, Vorschlag: die DCs), Domaene (015).`nUngueltige Bereiche werden abgelehnt; fuer andere Netze (VLANs) Hinweis auf DHCP-Relay am Router." },
+        @{ Text = 'Ausschluss hinzufuegen'; Aktion = 'Add-NetDhcpExclusion'; Hilfe = 'Adressen im Bereich, die nie vergeben werden (Drucker, Server, Router mit fester IP).' },
+        @{ Text = 'Optionen 003/006/015 aendern'; Aktion = 'Set-NetDhcpStandardOption'; Hilfe = 'Router, DNS-Server und Domaene eines Scopes aendern.' },
+        @{ Text = 'Scope aktivieren/deaktivieren'; Aktion = 'Switch-NetDhcpScopeState'; Hilfe = 'Ein deaktivierter Scope vergibt keine Adressen mehr.' },
+        @{ Text = 'Superscope anlegen'; Aktion = 'New-NetDhcpSuperscope'; Hilfe = 'Mehrere Scopes im selben physischen Netz zusammenfassen. Fuer getrennte VLANs nicht noetig.' },
+        @{ Text = 'Scope loeschen (gefaehrlich)'; Aktion = 'Remove-NetDhcpScope'; Hilfe = 'Loescht einen Scope mit allen Leases und Reservierungen. Vorher automatisches Backup, Servername eintippen.' }
+    )
+    Show-NetMenu -Titel 'DHCP - Scopes' -Eintraege $eintraege
+}
+#
+function Show-NetDhcpMenu {
+    $eintraege = @(
+        @{ Text = 'Uebersicht'; Aktion = 'Show-NetDhcpOverview'; Hilfe = 'Autorisierung, Nachkonfiguration, Konflikterkennung, alle Scopes und Failover auf einen Blick.' },
+        @{ Text = 'DHCP einrichten (Assistent)'; Aktion = 'Start-NetDhcpSetup'; Hilfe = 'Rolle, Nachkonfiguration, Autorisierung, Bindungen, erster Scope und Optionen - Erledigtes wird uebersprungen.' },
+        @{ Text = 'Rolle installieren und nachkonfigurieren'; Aktion = { Install-NetDhcpRole | Out-Null }; Hilfe = 'Installiert die DHCP-Rolle aus dem lokalen Windows und fuehrt die Nachkonfiguration aus (Sicherheitsgruppen, ConfigurationState = 2, Dienstneustart).' },
+        @{ Text = 'Im AD autorisieren'; Aktion = { Add-NetDhcpAuthorization | Out-Null }; Hilfe = 'In einer Domaene vergibt ein DHCP-Server erst nach der Autorisierung Adressen. Dafuer braucht es Organisations-Admins (Enterprise Admins). Ohne Domaene wird uebersprungen.' },
+        @{ Text = 'Bindungen anzeigen'; Aktion = 'Show-NetDhcpBinding'; Hilfe = 'Auf welchen Netzwerkkarten der DHCP-Server antwortet.' },
+        @{ Text = 'Bindungen einstellen'; Aktion = 'Set-NetDhcpBinding'; Hilfe = 'Nur Karten im Netz der Clients binden.' },
+        @{ Text = 'Scopes'; Aktion = 'Show-NetDhcpScopeMenu'; OhnePause = $true; Hilfe = 'Scopes anzeigen, anlegen, Ausschluesse, Optionen, aktivieren/deaktivieren, Superscope, loeschen.' },
+        @{ Text = 'Zusatzoptionen (NTP, PXE, Suchliste)'; Aktion = 'Show-NetDhcpExtraOptionMenu'; OhnePause = $true; Hilfe = 'Optionen 042, 066/067 und 119 - standardmaessig aus, auf Server- oder Scope-Ebene.' },
+        @{ Text = 'Reservierungen und Leases'; Aktion = 'Show-NetDhcpReservationMenu'; OhnePause = $true; Hilfe = 'Reservierungen anlegen (auch aus einem Lease), pruefen, loeschen; Leases anzeigen, suchen, loeschen; Konflikterkennung.' },
+        @{ Text = 'Failover'; Aktion = 'Show-NetDhcpFailoverMenu'; OhnePause = $true; Hilfe = 'Zweiter DHCP-Server fuer Ausfallsicherheit: Lastverteilung oder Reserve, Status, Replikation.' }
+    )
+    Show-NetMenu -Titel 'DHCP' -Eintraege $eintraege
 }
 # ----------------------------------------------------------------------
 # src/ui/Ersteinrichtung.ps1
