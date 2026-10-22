@@ -6,5 +6,20 @@
 
     # Reihenfolge der Quelldateien (relativ zum Hauptordner).
     # Der Eintrag '@checks' steht fuer alle Dateien in src/checks (alphabetisch).
-    Dateien = @()
+    Dateien = @(
+        'src/core/Zustand.ps1'
+        'src/core/Pfade.ps1'
+        'src/core/Log.ps1'
+        'src/core/Config.ps1'
+        'src/core/Fehler.ps1'
+        'src/core/IpHilfe.ps1'
+        'src/core/Aenderung.ps1'
+        'src/core/Umgebung.ps1'
+        'src/ui/Eingabe.ps1'
+        'src/ui/Menue.ps1'
+        'src/ui/Hilfe.ps1'
+        'src/ui/Einstellungen.ps1'
+        'src/ui/Hauptmenue.ps1'
+        'src/core/Start.ps1'
+    )
 }
