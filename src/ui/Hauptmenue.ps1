@@ -8,6 +8,11 @@ function Get-NetMainMenuEntry {
             Hilfe  = "Fuehrt Schritt fuer Schritt durch die komplette Einrichtung: AD -> DNS -> DHCP -> Verbindung DHCP/DNS -> Test.`nNetSetup erkennt, was schon erledigt ist, und ueberspringt es. Ideal fuer einen neuen Server."
         },
         @{
+            Text   = 'Bestandsaufnahme (Zustand des Servers)'
+            Aktion = 'Show-NetInventoryMenu'
+            Hilfe  = "Zeigt, was auf dem Server schon eingerichtet ist: Rolle, Funktionen, Dienste, Netzwerk, DNS, DHCP, Zeit.`nNur lesend. Kann gefundene DNS-/DHCP-Einstellungen in die NetSetup-Konfiguration uebernehmen."
+        },
+        @{
             Text   = 'Active Directory'
             Aktion = 'Show-NetAdMenu'
             Hilfe  = "Domaene anzeigen, neue Gesamtstruktur erstellen, Domaene beitreten oder zusaetzlicher Domaenencontroller werden.`nMit Vorpruefungen (feste IP, Hostname, DNS, Zeit) und automatischer Fortsetzung nach dem Neustart."

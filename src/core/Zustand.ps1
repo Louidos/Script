@@ -21,4 +21,7 @@ $script:NS = @{
     Zustand         = $null
     Checks          = New-Object System.Collections.ArrayList
     ErsterStart     = $false
+    Zusammenfassung = $null
+    AssistentAktiv  = $false
+    NeustartGeplant = $false
 }

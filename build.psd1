@@ -19,6 +19,10 @@
         'src/ui/Menue.ps1'
         'src/ui/Hilfe.ps1'
         'src/ui/Einstellungen.ps1'
+        'src/inventar/Bestandsaufnahme.ps1'
+        'src/inventar/Uebersicht.ps1'
+        'src/inventar/Uebernehmen.ps1'
+        'src/ui/Ersteinrichtung.ps1'
         'src/ui/Hauptmenue.ps1'
         'src/core/Start.ps1'
     )
