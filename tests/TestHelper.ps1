@@ -121,6 +121,7 @@ $stubDefinitionen = [ordered]@{
     'Set-DhcpServerv4DnsSetting'           = 'ScopeId', 'DynamicUpdates', 'DeleteDnsRROnLeaseExpiry', 'UpdateDnsRRForOlderClients', 'NameProtection', 'DisableDnsPtrRRUpdate'
     'Get-DhcpServerDnsCredential'          = 'ComputerName'
     'Set-DhcpServerDnsCredential'          = 'Credential'
+    'Remove-DhcpServerDnsCredential'       = '[switch]Force'
     'Get-DhcpServerv4Policy'               = 'Name', 'ScopeId'
     'Add-DhcpServerv4Policy'               = 'Name', 'ScopeId', 'Condition', 'VendorClass', 'UserClass', 'MacAddress', 'Enabled', 'Description', 'ProcessingOrder'
     'Set-DhcpServerv4Policy'               = 'Name', 'ScopeId', 'Enabled'
