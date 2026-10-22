@@ -22,7 +22,8 @@ Ohne Menü (z. B. für eine geplante Aufgabe):
 
 Im Aufbau. Fertig: Grundgerüst mit Hauptmenü, Hilfe, Glossar, Logging, Probelauf und
 Einstellungen; Bestandsaufnahme mit Statusübersicht beim Start; Ersteinrichtungs-Assistent;
-Active Directory (neue Gesamtstruktur, zusätzlicher DC, Beitritt) mit Fortsetzung nach Neustart.
+Active Directory (neue Gesamtstruktur, zusätzlicher DC, Beitritt) mit Fortsetzung nach Neustart;
+DNS (Zonen, Einträge, Weiterleitungen, Aufräumen, Abhör-Adressen).
 Die übrigen Menüpunkte sind als „kommt noch“ markiert.
 Details siehe [CHANGELOG.md](CHANGELOG.md).
 
