@@ -159,10 +159,11 @@ $stubDefinitionen = [ordered]@{
 
 $stubText = New-Object System.Text.StringBuilder
 foreach ($name in $stubDefinitionen.Keys) {
-    $params = @($stubDefinitionen[$name] | ForEach-Object {
+    $params = @($stubDefinitionen[$name] | Where-Object { $_ -ne 'InputObject' } | ForEach-Object {
             if ($_ -like '`[switch`]*') { '[switch]$' + $_.Substring(8) } else { '$' + $_ }
         })
-    [void]$stubText.AppendLine(("function {0} {{ param({1}) throw 'Stub {0} wurde im Test nicht gemockt.' }}" -f $name, ($params -join ', ')))
+    $params += '[Parameter(ValueFromPipeline = $true)][object]$InputObject'
+    [void]$stubText.AppendLine(("function {0} {{ [CmdletBinding()] param({1}) throw 'Stub {0} wurde im Test nicht gemockt.' }}" -f $name, ($params -join ', ')))
 }
 . ([scriptblock]::Create($stubText.ToString()))
 

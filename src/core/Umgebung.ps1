@@ -137,7 +137,9 @@ function Save-NetSelf {
 }
 
 function Get-NetPowerShellExe {
-    return (Join-Path -Path $env:SystemRoot -ChildPath 'System32\WindowsPowerShell\v1.0\powershell.exe')
+    $windows = $env:SystemRoot
+    if (-not $windows) { $windows = 'C:\Windows' }
+    return (Join-Path -Path $windows -ChildPath 'System32\WindowsPowerShell\v1.0\powershell.exe')
 }
 
 function Request-NetElevation {
