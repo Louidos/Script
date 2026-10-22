@@ -68,6 +68,7 @@ Mehr im [Handbuch](docs/handbuch.md) (alle Menüpunkte, typische Abläufe, Gloss
 
 ## Projektstand
 
+Aktuelle Version: **0.1.0** (erste Version, siehe [CHANGELOG.md](CHANGELOG.md)).
 Alle geplanten Funktionen sind umgesetzt und automatisch getestet (Pester mit Stubs, CI auf Windows PowerShell 5.1,
 inklusive Start des fertigen Scripts als Datei und als eingefügter Text). Tests auf echten Servern nach
 [docs/testplan.md](docs/testplan.md) stehen noch aus. Änderungen: [CHANGELOG.md](CHANGELOG.md).

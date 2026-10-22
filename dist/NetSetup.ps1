@@ -1,5 +1,5 @@
 <#
-    NetSetup 0.0.0 (Build 2026-10-22 22:20)
+    NetSetup 0.1.0 (Build 2026-10-22 22:34)
     AD, DNS und DHCP auf Windows Server einrichten, verwalten und reparieren.
 #
     So starten (PowerShell oder PowerShell ISE als Administrator):
@@ -13,8 +13,8 @@
     Nicht von Hand bearbeiten.
 #>
 $NetSetupCode = {
-$script:NetSetupVersion = '0.0.0'
-$script:NetSetupBuildDatum = '2026-10-22 22:20'
+$script:NetSetupVersion = '0.1.0'
+$script:NetSetupBuildDatum = '2026-10-22 22:34'
 # ----------------------------------------------------------------------
 # src/core/Zustand.ps1
 # ----------------------------------------------------------------------
