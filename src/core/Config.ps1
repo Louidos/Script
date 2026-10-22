@@ -30,6 +30,7 @@ function Get-NetDefaultConfig {
         AD            = @{
             Domaene  = ''
             NetBios  = ''
+            Modus    = ''
         }
         Dns           = @{
             Zonen           = @()

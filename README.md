@@ -21,7 +21,8 @@ Ohne Menü (z. B. für eine geplante Aufgabe):
 ## Projektstand
 
 Im Aufbau. Fertig: Grundgerüst mit Hauptmenü, Hilfe, Glossar, Logging, Probelauf und
-Einstellungen. Die übrigen Menüpunkte sind als „kommt noch“ markiert.
+Einstellungen; Bestandsaufnahme mit Statusübersicht beim Start; Ersteinrichtungs-Assistent.
+Die übrigen Menüpunkte sind als „kommt noch“ markiert.
 Details siehe [CHANGELOG.md](CHANGELOG.md).
 
 ## Entwicklung

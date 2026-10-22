@@ -1,5 +1,5 @@
 <#
-    NetSetup 0.0.0 (Build 2026-10-22 21:18)
+    NetSetup 0.0.0 (Build 2026-10-22 21:23)
     AD, DNS und DHCP auf Windows Server einrichten, verwalten und reparieren.
 #
     So starten (PowerShell oder PowerShell ISE als Administrator):
@@ -14,7 +14,7 @@
 #>
 $NetSetupCode = {
 $script:NetSetupVersion = '0.0.0'
-$script:NetSetupBuildDatum = '2026-10-22 21:18'
+$script:NetSetupBuildDatum = '2026-10-22 21:23'
 # ----------------------------------------------------------------------
 # src/core/Zustand.ps1
 # ----------------------------------------------------------------------
@@ -41,6 +41,9 @@ $script:NS = @{
     Zustand         = $null
     Checks          = New-Object System.Collections.ArrayList
     ErsterStart     = $false
+    Zusammenfassung = $null
+    AssistentAktiv  = $false
+    NeustartGeplant = $false
 }
 # ----------------------------------------------------------------------
 # src/core/Pfade.ps1
@@ -292,6 +295,7 @@ function Get-NetDefaultConfig {
         AD            = @{
             Domaene  = ''
             NetBios  = ''
+            Modus    = ''
         }
         Dns           = @{
             Zonen           = @()
@@ -2182,6 +2186,809 @@ function Show-NetSettingsMenu {
     Show-NetMenu -Titel 'Einstellungen' -Eintraege $eintraege -Kopf $kopf
 }
 # ----------------------------------------------------------------------
+# src/inventar/Bestandsaufnahme.ps1
+# ----------------------------------------------------------------------
+# Bestandsaufnahme: erfasst den kompletten Zustand des Servers.
+# NUR LESEND: hier werden ausschliesslich Get-*-Cmdlets, Test-Path und Get-ItemProperty verwendet.
+# Fehlende Module oder Rollen fuehren zu "nicht installiert" bzw. "Unbekannt", nie zum Absturz.
+#
+$script:NetFeatureNamen = @('AD-Domain-Services', 'DNS', 'DHCP', 'RSAT-AD-PowerShell', 'RSAT-ADDS', 'RSAT-DNS-Server', 'RSAT-DHCP')
+$script:NetDienstNamen = @('NTDS', 'Netlogon', 'DNS', 'DHCPServer', 'W32Time')
+$script:NetDomainRoleText = @{
+    0 = 'Eigenstaendige Arbeitsstation'
+    1 = 'Mitglied-Arbeitsstation'
+    2 = 'Eigenstaendiger Server (Arbeitsgruppe)'
+    3 = 'Mitgliedsserver einer Domaene'
+    4 = 'Domaenencontroller'
+    5 = 'Domaenencontroller (PDC-Emulator)'
+}
+#
+function ConvertTo-NetString {
+    <#
+    .SYNOPSIS
+        Wandelt IP-Objekte, Enums und Listen sicher in Text bzw. Textlisten um.
+    #>
+    param([AllowNull()][object]$Wert)
+    if ($null -eq $Wert) { return '' }
+    if ($Wert -is [System.Net.IPAddress]) { return $Wert.IPAddressToString }
+    return [string]$Wert
+}
+#
+function Get-NetSystemState {
+    $cs = Get-NetSafe -Beschreibung 'Win32_ComputerSystem' -Abfrage { Get-CimInstance -ClassName Win32_ComputerSystem }
+    $os = Get-NetSafe -Beschreibung 'Win32_OperatingSystem' -Abfrage { Get-CimInstance -ClassName Win32_OperatingSystem }
+    $installationsTyp = Get-NetSafe -Beschreibung 'InstallationType' -Abfrage { (Get-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -Name InstallationType).InstallationType }
+    $edition = Get-NetSafe -Beschreibung 'EditionID' -Abfrage { (Get-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -Name EditionID).EditionID }
+    $rolle = -1
+    if ($cs) { $rolle = [int]$cs.DomainRole }
+    $rolleText = 'Unbekannt'
+    if ($script:NetDomainRoleText.ContainsKey($rolle)) { $rolleText = $script:NetDomainRoleText[$rolle] }
+    $hostname = [Environment]::MachineName
+    if ($cs -and $cs.Name) { $hostname = [string]$cs.Name }
+    return @{
+        Hostname     = $hostname
+        OsName       = $(if ($os) { [string]$os.Caption } else { 'Unbekannt' })
+        OsVersion    = $(if ($os) { [string]$os.Version } else { '' })
+        Build        = $(if ($os) { [string]$os.BuildNumber } else { '' })
+        ProductType  = $(if ($os) { [int]$os.ProductType } else { 0 })
+        Edition      = [string]$edition
+        IstCore      = ([string]$installationsTyp -eq 'Server Core')
+        Sprache      = (Get-Culture).Name
+        UiSprache    = (Get-UICulture).Name
+        OsSprache    = $(if ($os) { [int]$os.OSLanguage } else { 0 })
+        DomainRole   = $rolle
+        RolleText    = $rolleText
+        IstDC        = ($rolle -ge 4)
+        IstPdc       = ($rolle -eq 5)
+        IstMitglied  = ($rolle -eq 1 -or $rolle -eq 3)
+        IstArbeitsgruppe = ($rolle -eq 0 -or $rolle -eq 2)
+        Domaene      = $(if ($cs -and $cs.PartOfDomain) { [string]$cs.Domain } else { '' })
+        Arbeitsgruppe = $(if ($cs -and -not $cs.PartOfDomain) { [string]$cs.Domain } else { '' })
+        IstAdmin     = (Test-NetIsAdmin)
+    }
+}
+#
+function Get-NetAdState {
+    param([Parameter(Mandatory = $true)][hashtable]$System)
+    $ad = @{ Verfuegbar = $false; Domaene = ''; NetBios = ''; Gesamtstruktur = ''; DomainMode = ''; ForestMode = ''; Pdc = ''; ModulFehlt = $false }
+    if (-not ($System.IstDC -or $System.IstMitglied)) { return $ad }
+    if (-not (Test-NetCommand -Name 'Get-ADDomain')) {
+        $ad.ModulFehlt = $true
+        $ad.Domaene = $System.Domaene
+        return $ad
+    }
+    $domaene = Get-NetSafe -Beschreibung 'Get-ADDomain' -Abfrage { Get-ADDomain }
+    $forest = Get-NetSafe -Beschreibung 'Get-ADForest' -Abfrage { Get-ADForest }
+    if ($domaene) {
+        $ad.Verfuegbar = $true
+        $ad.Domaene = [string]$domaene.DNSRoot
+        $ad.NetBios = [string]$domaene.NetBIOSName
+        $ad.DomainMode = [string]$domaene.DomainMode
+        $ad.Pdc = [string]$domaene.PDCEmulator
+    }
+    else { $ad.Domaene = $System.Domaene }
+    if ($forest) {
+        $ad.Gesamtstruktur = [string]$forest.Name
+        $ad.ForestMode = [string]$forest.ForestMode
+    }
+    return $ad
+}
+#
+function Get-NetFeatureState {
+    <#
+    .SYNOPSIS
+        Liefert pro Windows-Funktion den InstallState (Installed, Available, Removed, InstallPending, Unbekannt).
+    #>
+    $ergebnis = @{}
+    foreach ($n in $script:NetFeatureNamen) { $ergebnis[$n] = 'Unbekannt' }
+    if (-not (Test-NetCommand -Name 'Get-WindowsFeature')) { return $ergebnis }
+    $features = Get-NetSafe -Beschreibung 'Get-WindowsFeature' -Abfrage { Get-WindowsFeature -Name $script:NetFeatureNamen }
+    foreach ($f in @($features)) {
+        if ($f -and $f.Name) { $ergebnis[[string]$f.Name] = [string]$f.InstallState }
+    }
+    return $ergebnis
+}
+#
+function Get-NetServiceState {
+    $ergebnis = @{}
+    foreach ($n in $script:NetDienstNamen) {
+        $dienst = Get-NetSafe -Beschreibung "Dienst $n" -Abfrage { Get-Service -Name $n }
+        if ($dienst) {
+            $ergebnis[$n] = @{ Vorhanden = $true; Status = [string]$dienst.Status; StartTyp = [string]$dienst.StartType }
+        }
+        else {
+            $ergebnis[$n] = @{ Vorhanden = $false; Status = 'Fehlt'; StartTyp = '' }
+        }
+    }
+    return $ergebnis
+}
+#
+function Get-NetPendingReboot {
+    <#
+    .SYNOPSIS
+        Prueft, ob ein Neustart aussteht (CBS, Windows Update, PendingFileRenameOperations, Umbenennung).
+    #>
+    $gruende = @()
+    if (Test-Path -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending') { $gruende += 'Windows-Komponenten (CBS)' }
+    if (Test-Path -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired') { $gruende += 'Windows Update' }
+    $pfro = Get-NetSafe -Beschreibung 'PendingFileRenameOperations' -Abfrage {
+        (Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' -Name PendingFileRenameOperations).PendingFileRenameOperations
+    }
+    if ($pfro) { $gruende += 'Dateien warten auf Austausch (PendingFileRenameOperations)' }
+    $aktiv = Get-NetSafe -Beschreibung 'ActiveComputerName' -Abfrage { (Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\ComputerName\ActiveComputerName' -Name ComputerName).ComputerName }
+    $neu = Get-NetSafe -Beschreibung 'ComputerName' -Abfrage { (Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\ComputerName\ComputerName' -Name ComputerName).ComputerName }
+    if ($aktiv -and $neu -and ($aktiv -ne $neu)) { $gruende += "Umbenennung in $neu" }
+    return @{ Ausstehend = ($gruende.Count -gt 0); Gruende = $gruende }
+}
+#
+function Get-NetNetworkState {
+    $karten = @()
+    $adapter = @(Get-NetSafe -Beschreibung 'Get-NetAdapter' -Standard @() -Abfrage { Get-NetAdapter })
+    foreach ($a in $adapter) {
+        if ($null -eq $a) { continue }
+        $index = [int]$a.ifIndex
+        $ipif = Get-NetSafe -Beschreibung 'Get-NetIPInterface' -Abfrage { Get-NetIPInterface -InterfaceIndex $index -AddressFamily IPv4 }
+        $ips = @(Get-NetSafe -Beschreibung 'Get-NetIPAddress' -Standard @() -Abfrage { Get-NetIPAddress -InterfaceIndex $index -AddressFamily IPv4 })
+        $routen = @(Get-NetSafe -Beschreibung 'Get-NetRoute' -Standard @() -Abfrage { Get-NetRoute -InterfaceIndex $index -DestinationPrefix '0.0.0.0/0' })
+        $dns = Get-NetSafe -Beschreibung 'Get-DnsClientServerAddress' -Abfrage { Get-DnsClientServerAddress -InterfaceIndex $index -AddressFamily IPv4 }
+        $adressen = @()
+        foreach ($ip in $ips) {
+            if ($null -eq $ip -or -not $ip.IPAddress) { continue }
+            $adressen += @{ IP = [string]$ip.IPAddress; Prefix = [int]$ip.PrefixLength; Herkunft = [string]$ip.PrefixOrigin }
+        }
+        $karten += @{
+            Index        = $index
+            Name         = [string]$a.Name
+            Beschreibung = [string]$a.InterfaceDescription
+            Mac          = [string]$a.MacAddress
+            Status       = [string]$a.Status
+            Dhcp         = ($ipif -and ([string]$ipif.Dhcp -eq 'Enabled'))
+            Adressen     = $adressen
+            Gateway      = @($routen | Where-Object { $_ } | ForEach-Object { [string]$_.NextHop })
+            DnsServer    = $(if ($dns) { @($dns.ServerAddresses | ForEach-Object { [string]$_ }) } else { @() })
+        }
+    }
+    $aktiv = @($karten | Where-Object { $_.Status -eq 'Up' -and $_.Adressen.Count -gt 0 })
+    return @{
+        Karten         = $karten
+        AktiveKarten   = $aktiv
+        MehrereKarten  = ($aktiv.Count -gt 1)
+        EigeneIPs      = @($aktiv | ForEach-Object { $_.Adressen } | Where-Object { $_.IP -notlike '169.254.*' } | ForEach-Object { $_.IP })
+    }
+}
+#
+function Get-NetDnsState {
+    param([hashtable]$Features, [hashtable]$Dienste)
+    $dns = @{
+        Installiert     = ($Features['DNS'] -eq 'Installed')
+        Tools           = (Test-NetCommand -Name 'Get-DnsServerZone')
+        Laeuft          = ($Dienste['DNS'] -and $Dienste['DNS'].Status -eq 'Running')
+        Verfuegbar      = $false
+        Zonen           = @()
+        Weiterleitungen = @()
+        Scavenging      = $null
+        AbhoerIPs       = @()
+    }
+    if (-not ($dns.Tools -and $Dienste['DNS'] -and $Dienste['DNS'].Vorhanden)) { return $dns }
+    $zonen = Get-NetSafe -Beschreibung 'Get-DnsServerZone' -Abfrage { Get-DnsServerZone }
+    if ($null -eq $zonen) { return $dns }
+    $dns.Verfuegbar = $true
+    foreach ($z in @($zonen)) {
+        if ($null -eq $z) { continue }
+        $name = [string]$z.ZoneName
+        if ($name -eq 'TrustAnchors' -or $z.IsAutoCreated) { continue }
+        $aging = $null
+        if ([string]$z.ZoneType -eq 'Primary') {
+            $alter = Get-NetSafe -Beschreibung "Get-DnsServerZoneAging $name" -Abfrage { Get-DnsServerZoneAging -Name $name }
+            if ($alter) { $aging = @{ Aktiv = [bool]$alter.AgingEnabled; NoRefresh = [string]$alter.NoRefreshInterval; Refresh = [string]$alter.RefreshInterval } }
+        }
+        $dns.Zonen += @{
+            Name          = $name
+            Typ           = [string]$z.ZoneType
+            AdIntegriert  = [bool]$z.IsDsIntegrated
+            Reverse       = [bool]$z.IsReverseLookupZone
+            DynUpdate     = [string]$z.DynamicUpdate
+            Replikation   = [string]$z.ReplicationScope
+            Signiert      = [bool]$z.IsSigned
+            Aging         = $aging
+        }
+    }
+    $fw = Get-NetSafe -Beschreibung 'Get-DnsServerForwarder' -Abfrage { Get-DnsServerForwarder }
+    if ($fw) { $dns.Weiterleitungen = @($fw.IPAddress | Where-Object { $_ } | ForEach-Object { ConvertTo-NetString -Wert $_ }) }
+    $sc = Get-NetSafe -Beschreibung 'Get-DnsServerScavenging' -Abfrage { Get-DnsServerScavenging }
+    if ($sc) {
+        $dns.Scavenging = @{
+            Aktiv     = [bool]$sc.ScavengingState
+            Intervall = [string]$sc.ScavengingInterval
+            NoRefresh = [string]$sc.NoRefreshInterval
+            Refresh   = [string]$sc.RefreshInterval
+        }
+    }
+    $einst = Get-NetSafe -Beschreibung 'Get-DnsServerSetting' -Abfrage { Get-DnsServerSetting -All }
+    if ($einst -and $einst.ListeningIPAddress) { $dns.AbhoerIPs = @($einst.ListeningIPAddress | ForEach-Object { ConvertTo-NetString -Wert $_ }) }
+    return $dns
+}
+#
+function Get-NetDhcpScopeState {
+    param([Parameter(Mandatory = $true)][object]$Scope)
+    $id = ConvertTo-NetString -Wert $Scope.ScopeId
+    $optionen = @{}
+    foreach ($o in @(Get-NetSafe -Beschreibung "Optionen $id" -Standard @() -Abfrage { Get-DhcpServerv4OptionValue -ScopeId $id })) {
+        if ($o) { $optionen[[string][int]$o.OptionId] = @($o.Value | ForEach-Object { [string]$_ }) }
+    }
+    $ausschluesse = @()
+    foreach ($a in @(Get-NetSafe -Beschreibung "Ausschluesse $id" -Standard @() -Abfrage { Get-DhcpServerv4ExclusionRange -ScopeId $id })) {
+        if ($a) { $ausschluesse += @{ Start = (ConvertTo-NetString -Wert $a.StartRange); Ende = (ConvertTo-NetString -Wert $a.EndRange) } }
+    }
+    $reservierungen = @()
+    foreach ($r in @(Get-NetSafe -Beschreibung "Reservierungen $id" -Standard @() -Abfrage { Get-DhcpServerv4Reservation -ScopeId $id })) {
+        if ($r) { $reservierungen += @{ IP = (ConvertTo-NetString -Wert $r.IPAddress); ClientId = [string]$r.ClientId; Name = [string]$r.Name; Beschreibung = [string]$r.Description } }
+    }
+    $stat = Get-NetSafe -Beschreibung "Statistik $id" -Abfrage { Get-DhcpServerv4ScopeStatistics -ScopeId $id }
+    $dnsSetting = Get-NetSafe -Beschreibung "DNS-Einstellung $id" -Abfrage { Get-DhcpServerv4DnsSetting -ScopeId $id }
+    $maske = ConvertTo-NetString -Wert $Scope.SubnetMask
+    return @{
+        ScopeId        = $id
+        Name           = [string]$Scope.Name
+        Start          = (ConvertTo-NetString -Wert $Scope.StartRange)
+        Ende           = (ConvertTo-NetString -Wert $Scope.EndRange)
+        Maske          = $maske
+        Prefix         = (ConvertTo-NetPrefixLength -SubnetMask $maske)
+        Status         = [string]$Scope.State
+        Aktiv          = ([string]$Scope.State -eq 'Active')
+        LeaseDauer     = [string]$Scope.LeaseDuration
+        LeaseTage      = $(if ($Scope.LeaseDuration -is [TimeSpan]) { [double]$Scope.LeaseDuration.TotalDays } else { 0 })
+        Superscope     = [string]$Scope.SuperscopeName
+        Optionen       = $optionen
+        Ausschluesse   = $ausschluesse
+        Reservierungen = $reservierungen
+        Auslastung     = $(if ($stat) { [double]$stat.PercentageInUse } else { -1 })
+        Frei           = $(if ($stat) { [int]$stat.Free } else { -1 })
+        Belegt         = $(if ($stat) { [int]$stat.InUse } else { -1 })
+        DnsEinstellung = (ConvertTo-NetDhcpDnsSetting -Einstellung $dnsSetting)
+    }
+}
+#
+function ConvertTo-NetDhcpDnsSetting {
+    param([AllowNull()][object]$Einstellung)
+    if ($null -eq $Einstellung) { return $null }
+    return @{
+        DynamicUpdates             = [string]$Einstellung.DynamicUpdates
+        DeleteDnsRROnLeaseExpiry   = [bool]$Einstellung.DeleteDnsRROnLeaseExpiry
+        UpdateDnsRRForOlderClients = [bool]$Einstellung.UpdateDnsRRForOlderClients
+        NameProtection             = [bool]$Einstellung.NameProtection
+        DisableDnsPtrRRUpdate      = [bool]$Einstellung.DisableDnsPtrRRUpdate
+    }
+}
+#
+function Get-NetDhcpState {
+    param([hashtable]$Features, [hashtable]$Dienste)
+    $dhcp = @{
+        Installiert      = ($Features['DHCP'] -eq 'Installed')
+        Tools            = (Test-NetCommand -Name 'Get-DhcpServerv4Scope')
+        Laeuft           = ($Dienste['DHCPServer'] -and $Dienste['DHCPServer'].Status -eq 'Running')
+        Verfuegbar       = $false
+        Nachkonfiguriert = $false
+        Autorisiert      = $null
+        InDomaene        = $false
+        Bindungen        = @()
+        Scopes           = @()
+        ServerOptionen   = @{}
+        Failover         = @()
+        DnsEinstellung   = $null
+        DnsZugangsdaten  = @{ Gesetzt = $false; Benutzer = ''; Domaene = '' }
+        KonfliktErkennung = 0
+    }
+    $status = Get-NetSafe -Beschreibung 'DHCP ConfigurationState' -Abfrage { (Get-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\ServerManager\Roles\12' -Name ConfigurationState).ConfigurationState }
+    $dhcp.Nachkonfiguriert = ([int]$status -eq 2)
+    if (-not ($dhcp.Tools -and $Dienste['DHCPServer'] -and $Dienste['DHCPServer'].Vorhanden)) { return $dhcp }
+    $einst = Get-NetSafe -Beschreibung 'Get-DhcpServerSetting' -Abfrage { Get-DhcpServerSetting }
+    if ($null -eq $einst) { return $dhcp }
+    $dhcp.Verfuegbar = $true
+    $dhcp.Autorisiert = [bool]$einst.IsAuthorized
+    $dhcp.InDomaene = [bool]$einst.IsDomainJoined
+    $dhcp.KonfliktErkennung = [int]$einst.ConflictDetectionAttempts
+    foreach ($b in @(Get-NetSafe -Beschreibung 'Get-DhcpServerv4Binding' -Standard @() -Abfrage { Get-DhcpServerv4Binding })) {
+        if ($b) { $dhcp.Bindungen += @{ Karte = [string]$b.InterfaceAlias; IP = (ConvertTo-NetString -Wert $b.IPAddress); Aktiv = [bool]$b.BindingState } }
+    }
+    foreach ($s in @(Get-NetSafe -Beschreibung 'Get-DhcpServerv4Scope' -Standard @() -Abfrage { Get-DhcpServerv4Scope })) {
+        if ($s) { $dhcp.Scopes += (Get-NetDhcpScopeState -Scope $s) }
+    }
+    foreach ($o in @(Get-NetSafe -Beschreibung 'Serveroptionen' -Standard @() -Abfrage { Get-DhcpServerv4OptionValue })) {
+        if ($o) { $dhcp.ServerOptionen[[string][int]$o.OptionId] = @($o.Value | ForEach-Object { [string]$_ }) }
+    }
+    foreach ($f in @(Get-NetSafe -Beschreibung 'Get-DhcpServerv4Failover' -Standard @() -Abfrage { Get-DhcpServerv4Failover })) {
+        if ($f) {
+            $dhcp.Failover += @{
+                Name    = [string]$f.Name
+                Partner = [string]$f.PartnerServer
+                Modus   = [string]$f.Mode
+                Status  = [string]$f.State
+                Scopes  = @($f.ScopeId | ForEach-Object { ConvertTo-NetString -Wert $_ })
+            }
+        }
+    }
+    $dhcp.DnsEinstellung = ConvertTo-NetDhcpDnsSetting -Einstellung (Get-NetSafe -Beschreibung 'DHCP DNS-Einstellung' -Abfrage { Get-DhcpServerv4DnsSetting })
+    $cred = Get-NetSafe -Beschreibung 'Get-DhcpServerDnsCredential' -Abfrage { Get-DhcpServerDnsCredential }
+    if ($cred -and $cred.UserName) {
+        $dhcp.DnsZugangsdaten = @{ Gesetzt = $true; Benutzer = [string]$cred.UserName; Domaene = [string]$cred.DomainName }
+    }
+    return $dhcp
+}
+#
+function Get-NetTimeState {
+    $param = Get-NetSafe -Beschreibung 'W32Time Parameter' -Abfrage { Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Services\W32Time\Parameters' }
+    $typ = ''
+    $ntp = ''
+    if ($param) { $typ = [string]$param.Type; $ntp = [string]$param.NtpServer }
+    return @{ Typ = $typ; NtpServer = $ntp }
+}
+#
+function Get-NetSetupState {
+    <#
+    .SYNOPSIS
+        Erfasst den kompletten Zustand des Servers (nur lesend) und merkt ihn in $script:NS.Zustand.
+    #>
+    $system = Get-NetSystemState
+    $features = Get-NetFeatureState
+    $dienste = Get-NetServiceState
+    $zustand = @{
+        Zeitpunkt = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
+        System    = $system
+        AD        = (Get-NetAdState -System $system)
+        Features  = $features
+        Dienste   = $dienste
+        Neustart  = (Get-NetPendingReboot)
+        Netzwerk  = (Get-NetNetworkState)
+        Dns       = (Get-NetDnsState -Features $features -Dienste $dienste)
+        Dhcp      = (Get-NetDhcpState -Features $features -Dienste $dienste)
+        Zeit      = (Get-NetTimeState)
+    }
+    $script:NS.Zustand = $zustand
+    return $zustand
+}
+#
+function Get-NetDomainName {
+    <#
+    .SYNOPSIS
+        Liefert den DNS-Namen der Domaene aus dem Zustand (oder aus der Config).
+    #>
+    param([hashtable]$Zustand = $script:NS.Zustand)
+    if ($Zustand -and $Zustand.AD -and $Zustand.AD.Domaene) { return [string]$Zustand.AD.Domaene }
+    if ($Zustand -and $Zustand.System -and $Zustand.System.Domaene) { return [string]$Zustand.System.Domaene }
+    return [string](Get-NetConfigValue -Pfad 'AD.Domaene' -Standard '')
+}
+# ----------------------------------------------------------------------
+# src/inventar/Uebersicht.ps1
+# ----------------------------------------------------------------------
+# Statusuebersicht: eine Zeile pro Bereich mit [OK], [WARN], [FEHLER] oder [--].
+#
+function New-NetSummaryLine {
+    param([string]$Bereich, [ValidateSet('OK', 'WARN', 'FEHLER', 'NA', 'INFO')][string]$Status, [string]$Text)
+    return [pscustomobject]@{ Bereich = $Bereich; Status = $Status; Text = $Text }
+}
+#
+function Get-NetStateSummary {
+    <#
+    .SYNOPSIS
+        Bewertet die Bestandsaufnahme pro Bereich (System, Neustart, AD, Netzwerk, DNS, DHCP, DHCP+DNS, Zeit).
+    #>
+    param([Parameter(Mandatory = $true)][hashtable]$Zustand)
+    $zeilen = @()
+    $s = $Zustand.System
+#
+    # System
+    $art = 'Desktop'
+    if ($s.IstCore) { $art = 'Server Core' }
+    if (-not $s.IstAdmin) { $zeilen += New-NetSummaryLine -Bereich 'System' -Status 'WARN' -Text ('{0} ({1}) - ohne Administratorrechte' -f $s.OsName, $art) }
+    else { $zeilen += New-NetSummaryLine -Bereich 'System' -Status 'OK' -Text ('{0} ({1}), Sprache {2}' -f $s.OsName, $art, $s.UiSprache) }
+#
+    # Neustart
+    if ($Zustand.Neustart.Ausstehend) { $zeilen += New-NetSummaryLine -Bereich 'Neustart' -Status 'WARN' -Text ('Neustart ausstehend: ' + ($Zustand.Neustart.Gruende -join ', ')) }
+    else { $zeilen += New-NetSummaryLine -Bereich 'Neustart' -Status 'OK' -Text 'kein Neustart ausstehend' }
+#
+    # Active Directory
+    $adFeature = $Zustand.Features['AD-Domain-Services']
+    if ($s.IstDC) {
+        $ntds = $Zustand.Dienste['NTDS']
+        if ($ntds -and $ntds.Vorhanden -and $ntds.Status -ne 'Running') { $zeilen += New-NetSummaryLine -Bereich 'Active Directory' -Status 'FEHLER' -Text ('Domaenencontroller, aber der Dienst NTDS laeuft nicht ({0})' -f $ntds.Status) }
+        elseif ($Zustand.AD.ModulFehlt) { $zeilen += New-NetSummaryLine -Bereich 'Active Directory' -Status 'WARN' -Text ('Domaenencontroller fuer {0}, AD-Verwaltungstools fehlen (RSAT-AD-PowerShell)' -f $Zustand.AD.Domaene) }
+        else { $zeilen += New-NetSummaryLine -Bereich 'Active Directory' -Status 'OK' -Text ('Domaenencontroller fuer {0} ({1})' -f $Zustand.AD.Domaene, $Zustand.AD.NetBios) }
+    }
+    elseif ($s.IstMitglied) {
+        $text = 'Mitgliedsserver der Domaene ' + $s.Domaene
+        if ($adFeature -eq 'Installed') { $text += ', Rolle AD DS installiert aber nicht heraufgestuft' }
+        $zeilen += New-NetSummaryLine -Bereich 'Active Directory' -Status $(if ($adFeature -eq 'Installed') { 'WARN' } else { 'INFO' }) -Text $text
+    }
+    elseif ($s.IstArbeitsgruppe) {
+        $modus = Get-NetConfigValue -Pfad 'AD.Modus' -Standard ''
+        if ($adFeature -eq 'Installed') { $zeilen += New-NetSummaryLine -Bereich 'Active Directory' -Status 'WARN' -Text 'Rolle AD DS installiert, aber der Server ist noch kein Domaenencontroller' }
+        elseif ($modus -eq 'OhneAD') { $zeilen += New-NetSummaryLine -Bereich 'Active Directory' -Status 'NA' -Text 'bewusst ohne AD (Arbeitsgruppe)' }
+        else { $zeilen += New-NetSummaryLine -Bereich 'Active Directory' -Status 'NA' -Text ('kein AD - Arbeitsgruppe {0}' -f $s.Arbeitsgruppe) }
+    }
+    else { $zeilen += New-NetSummaryLine -Bereich 'Active Directory' -Status 'WARN' -Text 'Rolle des Servers unbekannt' }
+#
+    # Netzwerk
+    $n = $Zustand.Netzwerk
+    if ($n.AktiveKarten.Count -eq 0) {
+        $zeilen += New-NetSummaryLine -Bereich 'Netzwerk' -Status 'FEHLER' -Text 'keine aktive Netzwerkkarte mit IPv4-Adresse gefunden'
+    }
+    else {
+        $k = $n.AktiveKarten[0]
+        $ip = ($k.Adressen | Select-Object -First 1)
+        $text = '{0}: {1}/{2}' -f $k.Name, $ip.IP, $ip.Prefix
+        if ($k.Gateway.Count -gt 0) { $text += ', Gateway ' + $k.Gateway[0] }
+        if ($k.DnsServer.Count -gt 0) { $text += ', DNS ' + ($k.DnsServer -join ' ') }
+        $probleme = @()
+        if (@($n.AktiveKarten | Where-Object { $_.Dhcp }).Count -gt 0) { $probleme += 'IP per DHCP (Server brauchen eine feste IP)' }
+        if ($n.MehrereKarten) { $probleme += ('{0} aktive Netzwerkkarten' -f $n.AktiveKarten.Count) }
+        if ($s.IstDC -and $k.DnsServer.Count -gt 0) {
+            $eigene = @($n.EigeneIPs) + @('127.0.0.1')
+            if (@($k.DnsServer | Where-Object { $eigene -contains $_ }).Count -eq 0) { $probleme += 'DC fragt nicht sich selbst als DNS' }
+        }
+        if ($probleme.Count -gt 0) { $zeilen += New-NetSummaryLine -Bereich 'Netzwerk' -Status 'WARN' -Text ($text + ' - ' + ($probleme -join ', ')) }
+        else { $zeilen += New-NetSummaryLine -Bereich 'Netzwerk' -Status 'OK' -Text ($text + ', feste IP') }
+    }
+#
+    # DNS
+    $d = $Zustand.Dns
+    $dnsFeature = $Zustand.Features['DNS']
+    if (-not $d.Installiert -and -not ($Zustand.Dienste['DNS'] -and $Zustand.Dienste['DNS'].Vorhanden)) {
+        $zeilen += New-NetSummaryLine -Bereich 'DNS' -Status 'NA' -Text ('nicht installiert ({0})' -f (ConvertTo-NetFeatureText -Status $dnsFeature))
+    }
+    elseif (-not $d.Laeuft) {
+        $zeilen += New-NetSummaryLine -Bereich 'DNS' -Status 'FEHLER' -Text 'installiert, aber der DNS-Dienst laeuft nicht'
+    }
+    elseif (-not $d.Tools) {
+        $zeilen += New-NetSummaryLine -Bereich 'DNS' -Status 'WARN' -Text 'Dienst laeuft, Verwaltungstools fehlen (RSAT-DNS-Server)'
+    }
+    elseif (-not $d.Verfuegbar) {
+        $zeilen += New-NetSummaryLine -Bereich 'DNS' -Status 'WARN' -Text 'Zustand unbekannt (Abfrage fehlgeschlagen, Details im Log)'
+    }
+    else {
+        $forward = @($d.Zonen | Where-Object { -not $_.Reverse })
+        $reverse = @($d.Zonen | Where-Object { $_.Reverse })
+        $text = '{0} Zone(n), {1} Reverse-Zone(n)' -f $forward.Count, $reverse.Count
+        if ($d.Weiterleitungen.Count -gt 0) { $text += ', Weiterleitung ' + ($d.Weiterleitungen -join ' ') }
+        else { $text += ', keine Weiterleitung' }
+        $warn = @()
+        if ($forward.Count -eq 0) { $warn += 'keine Zone' }
+        if ($reverse.Count -eq 0) { $warn += 'keine Reverse-Zone' }
+        if ($warn.Count -gt 0) { $zeilen += New-NetSummaryLine -Bereich 'DNS' -Status 'WARN' -Text ($text + ' - ' + ($warn -join ', ')) }
+        else { $zeilen += New-NetSummaryLine -Bereich 'DNS' -Status 'OK' -Text $text }
+    }
+#
+    # DHCP
+    $h = $Zustand.Dhcp
+    if (-not $h.Installiert -and -not ($Zustand.Dienste['DHCPServer'] -and $Zustand.Dienste['DHCPServer'].Vorhanden)) {
+        $zeilen += New-NetSummaryLine -Bereich 'DHCP' -Status 'NA' -Text ('nicht installiert ({0})' -f (ConvertTo-NetFeatureText -Status $Zustand.Features['DHCP']))
+    }
+    elseif (-not $h.Laeuft) {
+        $zeilen += New-NetSummaryLine -Bereich 'DHCP' -Status 'FEHLER' -Text 'installiert, aber der DHCP-Dienst laeuft nicht'
+    }
+    elseif (-not $h.Tools) {
+        $zeilen += New-NetSummaryLine -Bereich 'DHCP' -Status 'WARN' -Text 'Dienst laeuft, Verwaltungstools fehlen (RSAT-DHCP)'
+    }
+    elseif (-not $h.Verfuegbar) {
+        $zeilen += New-NetSummaryLine -Bereich 'DHCP' -Status 'WARN' -Text 'Zustand unbekannt (Abfrage fehlgeschlagen, Details im Log)'
+    }
+    else {
+        $aktiv = @($h.Scopes | Where-Object { $_.Aktiv })
+        $text = '{0} Scope(s), davon {1} aktiv' -f $h.Scopes.Count, $aktiv.Count
+        $warn = @()
+        $fehler = @()
+        if (-not $h.Nachkonfiguriert) { $warn += 'Nachkonfiguration fehlt' }
+        if ($h.InDomaene -and -not $h.Autorisiert) { $fehler += 'nicht im AD autorisiert' }
+        if ($h.Scopes.Count -eq 0) { $warn += 'kein Scope' }
+        $grenze = [int](Get-NetConfigValue -Pfad 'Vorschlaege.AuslastungWarnung' -Standard 80)
+        foreach ($sc in $aktiv) {
+            if ($sc.Auslastung -ge $grenze) { $warn += ('{0} zu {1:N0}% belegt' -f $sc.ScopeId, $sc.Auslastung) }
+        }
+        if ($fehler.Count -gt 0) { $zeilen += New-NetSummaryLine -Bereich 'DHCP' -Status 'FEHLER' -Text ($text + ' - ' + (($fehler + $warn) -join ', ')) }
+        elseif ($warn.Count -gt 0) { $zeilen += New-NetSummaryLine -Bereich 'DHCP' -Status 'WARN' -Text ($text + ' - ' + ($warn -join ', ')) }
+        else { $zeilen += New-NetSummaryLine -Bereich 'DHCP' -Status 'OK' -Text $text }
+    }
+#
+    # DHCP + DNS
+    if (-not $h.Verfuegbar) {
+        $zeilen += New-NetSummaryLine -Bereich 'DHCP + DNS' -Status 'NA' -Text 'kein DHCP-Server auf diesem Server'
+    }
+    else {
+        $warn = @()
+        $e = $h.DnsEinstellung
+        if (-not $e -or $e.DynamicUpdates -ne 'Always') { $warn += 'DNS-Eintraege nicht fuer alle Clients' }
+        if (-not $e -or -not $e.DeleteDnsRROnLeaseExpiry) { $warn += 'alte Eintraege werden nicht entfernt' }
+        if ($s.IstDC -and -not $h.DnsZugangsdaten.Gesetzt) { $warn += 'DHCP auf DC ohne DNS-Zugangsdaten' }
+        if ($warn.Count -gt 0) { $zeilen += New-NetSummaryLine -Bereich 'DHCP + DNS' -Status 'WARN' -Text ($warn -join ', ') }
+        else { $zeilen += New-NetSummaryLine -Bereich 'DHCP + DNS' -Status 'OK' -Text ('Clients werden automatisch eingetragen (Konto {0})' -f $(if ($h.DnsZugangsdaten.Gesetzt) { $h.DnsZugangsdaten.Benutzer } else { 'Computerkonto' })) }
+    }
+#
+    # Zeit
+    $t = $Zustand.Zeit
+    if (-not $t.Typ) { $zeilen += New-NetSummaryLine -Bereich 'Zeit' -Status 'WARN' -Text 'Zeitdienst-Einstellung nicht lesbar' }
+    elseif ($s.IstPdc -and $t.Typ -ne 'NTP') { $zeilen += New-NetSummaryLine -Bereich 'Zeit' -Status 'WARN' -Text ('PDC-Emulator ohne externe Zeitquelle (Typ {0})' -f $t.Typ) }
+    elseif ($s.IstPdc) { $zeilen += New-NetSummaryLine -Bereich 'Zeit' -Status 'OK' -Text ('PDC holt die Zeit von {0}' -f $t.NtpServer) }
+    elseif (($s.IstMitglied -or $s.IstDC) -and $t.Typ -ne 'NT5DS') { $zeilen += New-NetSummaryLine -Bereich 'Zeit' -Status 'WARN' -Text ('Domaenenmitglied, folgt aber nicht der Domaenenhierarchie (Typ {0})' -f $t.Typ) }
+    else { $zeilen += New-NetSummaryLine -Bereich 'Zeit' -Status 'OK' -Text ('Zeitquelle: {0} {1}' -f $t.Typ, $t.NtpServer).Trim() }
+#
+    return $zeilen
+}
+#
+function ConvertTo-NetFeatureText {
+    param([string]$Status)
+    switch ($Status) {
+        'Installed' { return 'installiert' }
+        'Available' { return 'verfuegbar' }
+        'Removed' { return 'Dateien entfernt' }
+        'InstallPending' { return 'Installation wartet auf Neustart' }
+        'UninstallPending' { return 'Deinstallation wartet auf Neustart' }
+        default { return 'unbekannt' }
+    }
+}
+#
+function Show-NetStartOverview {
+    <#
+    .SYNOPSIS
+        Bestandsaufnahme beim Start mit einer Zeile pro Bereich.
+    #>
+    Write-Log -Message 'Bestandsaufnahme laeuft (nur lesend) ...'
+    $zustand = Get-NetSetupState
+    $zeilen = Get-NetStateSummary -Zustand $zustand
+    $script:NS.Zusammenfassung = $zeilen
+    Write-NetTitle -Titel ('Bestandsaufnahme {0} ({1})' -f $zustand.System.Hostname, $zustand.System.RolleText)
+    foreach ($z in $zeilen) { Write-NetStatus -Status $z.Status -Bereich $z.Bereich -Text $z.Text }
+    $probleme = @($zeilen | Where-Object { $_.Status -eq 'FEHLER' -or $_.Status -eq 'WARN' })
+    if ($probleme.Count -gt 0) {
+        Write-Host ''
+        Write-Log -Message 'Tipp: Der Doktor im Hauptmenue erklaert und repariert die markierten Punkte.'
+    }
+}
+#
+function Show-NetStatusLine {
+    <#
+    .SYNOPSIS
+        Kurze Statuszeile fuer den Kopf des Hauptmenues (aus der letzten Bestandsaufnahme).
+    #>
+    $zeilen = $script:NS.Zusammenfassung
+    if (-not $zeilen) { return }
+    $teile = @()
+    foreach ($z in $zeilen) {
+        if (@('Active Directory', 'DNS', 'DHCP', 'DHCP + DNS', 'Netzwerk') -notcontains $z.Bereich) { continue }
+        $marke = @{ OK = 'OK'; WARN = 'WARN'; FEHLER = 'FEHLER'; NA = '--'; INFO = 'i' }[$z.Status]
+        $teile += ('{0} [{1}]' -f $z.Bereich, $marke)
+    }
+    Write-Host ('  Status: ' + ($teile -join '  ')) -ForegroundColor DarkCyan
+}
+#
+function Show-NetStateDetail {
+    <#
+    .SYNOPSIS
+        Zeigt die komplette Bestandsaufnahme ausfuehrlich an.
+    #>
+    $z = Get-NetSetupState
+    $script:NS.Zusammenfassung = Get-NetStateSummary -Zustand $z
+    Write-NetTitle -Titel 'Bestandsaufnahme im Detail'
+    Write-Host ('  Server       : {0} - {1}' -f $z.System.Hostname, $z.System.RolleText)
+    Write-Host ('  Windows      : {0} {1} Build {2}, {3}' -f $z.System.OsName, $z.System.Edition, $z.System.Build, $(if ($z.System.IstCore) { 'Server Core' } else { 'Desktop' }))
+    Write-Host ('  Sprache      : {0} / Oberflaeche {1}' -f $z.System.Sprache, $z.System.UiSprache)
+    if ($z.AD.Domaene) { Write-Host ('  Domaene      : {0} (NetBIOS {1}), Gesamtstruktur {2}, Ebene {3}' -f $z.AD.Domaene, $z.AD.NetBios, $z.AD.Gesamtstruktur, $z.AD.DomainMode) }
+    Write-Host '  Funktionen   :'
+    foreach ($f in ($z.Features.Keys | Sort-Object)) { Write-Host ('    {0,-22} {1}' -f $f, (ConvertTo-NetFeatureText -Status $z.Features[$f])) }
+    Write-Host '  Dienste      :'
+    foreach ($d in ($z.Dienste.Keys | Sort-Object)) {
+        $x = $z.Dienste[$d]
+        if ($x.Vorhanden) { Write-Host ('    {0,-22} {1} (Start: {2})' -f $d, $x.Status, $x.StartTyp) }
+        else { Write-Host ('    {0,-22} nicht vorhanden' -f $d) -ForegroundColor DarkGray }
+    }
+    Write-Host '  Netzwerk     :'
+    foreach ($k in $z.Netzwerk.Karten) {
+        $ips = ($k.Adressen | ForEach-Object { '{0}/{1}' -f $_.IP, $_.Prefix }) -join ', '
+        Write-Host ('    [{0}] {1} ({2}) {3} {4} GW {5} DNS {6}' -f $k.Index, $k.Name, $k.Status, $(if ($k.Dhcp) { 'DHCP' } else { 'statisch' }), $ips, ($k.Gateway -join ' '), ($k.DnsServer -join ' '))
+    }
+    if ($z.Dns.Verfuegbar) {
+        Write-Host '  DNS-Zonen    :'
+        foreach ($zone in $z.Dns.Zonen) {
+            Write-Host ('    {0,-35} {1,-9} {2,-12} Updates: {3}' -f $zone.Name, $zone.Typ, $(if ($zone.AdIntegriert) { 'AD (' + $zone.Replikation + ')' } else { 'Datei' }), $zone.DynUpdate)
+        }
+        Write-Host ('  Weiterleitung: {0}' -f $(if ($z.Dns.Weiterleitungen.Count) { $z.Dns.Weiterleitungen -join ', ' } else { 'keine (Stammhinweise)' }))
+        if ($z.Dns.Scavenging) { Write-Host ('  Scavenging   : {0}, No-Refresh {1}, Refresh {2}' -f $(if ($z.Dns.Scavenging.Aktiv) { 'an' } else { 'aus' }), $z.Dns.Scavenging.NoRefresh, $z.Dns.Scavenging.Refresh) }
+    }
+    if ($z.Dhcp.Verfuegbar) {
+        Write-Host ('  DHCP         : autorisiert {0}, nachkonfiguriert {1}, Konflikterkennung {2}' -f $z.Dhcp.Autorisiert, $z.Dhcp.Nachkonfiguriert, $z.Dhcp.KonfliktErkennung)
+        foreach ($sc in $z.Dhcp.Scopes) {
+            Write-Host ('    {0,-15} {1,-20} {2} - {3} /{4} {5} Lease {6:N1} Tage, belegt {7:N0}%' -f $sc.ScopeId, $sc.Name, $sc.Start, $sc.Ende, $sc.Prefix, $sc.Status, $sc.LeaseTage, $sc.Auslastung)
+            $opt = @()
+            foreach ($id in @('3', '6', '15')) { if ($sc.Optionen.ContainsKey($id)) { $opt += ('{0}={1}' -f $id, ($sc.Optionen[$id] -join ',')) } }
+            if ($opt.Count) { Write-Host ('      Optionen: ' + ($opt -join '; ')) -ForegroundColor DarkGray }
+        }
+        foreach ($f in $z.Dhcp.Failover) { Write-Host ('    Failover {0} mit {1}: {2}, {3}' -f $f.Name, $f.Partner, $f.Modus, $f.Status) }
+    }
+    Write-Host ('  Zeit         : Typ {0}, Server {1}' -f $z.Zeit.Typ, $z.Zeit.NtpServer)
+    if ($z.Neustart.Ausstehend) { Write-Host ('  Neustart     : ausstehend ({0})' -f ($z.Neustart.Gruende -join ', ')) -ForegroundColor Yellow }
+    Write-Host ''
+    foreach ($zeile in $script:NS.Zusammenfassung) { Write-NetStatus -Status $zeile.Status -Bereich $zeile.Bereich -Text $zeile.Text }
+}
+# ----------------------------------------------------------------------
+# src/inventar/Uebernehmen.ps1
+# ----------------------------------------------------------------------
+# "Vorhandene Konfiguration uebernehmen": schreibt gefundene AD-, DNS- und DHCP-Einstellungen
+# in die NetSetup-Konfiguration. Am Server wird dabei nichts geaendert.
+#
+function ConvertTo-NetConfigFromState {
+    <#
+    .SYNOPSIS
+        Baut aus der Bestandsaufnahme die Bereiche AD, Dns und Dhcp der Konfiguration.
+    #>
+    param([Parameter(Mandatory = $true)][hashtable]$Zustand)
+    $ad = @{ Domaene = [string]$Zustand.AD.Domaene; NetBios = [string]$Zustand.AD.NetBios }
+    $dns = @{
+        Zonen           = @($Zustand.Dns.Zonen | ForEach-Object {
+                @{ Name = $_.Name; Typ = $_.Typ; AdIntegriert = $_.AdIntegriert; Reverse = $_.Reverse; DynUpdate = $_.DynUpdate; Replikation = $_.Replikation }
+            })
+        Weiterleitungen = @($Zustand.Dns.Weiterleitungen)
+        Scavenging      = $(if ($Zustand.Dns.Scavenging) { $Zustand.Dns.Scavenging } else { @{} })
+    }
+    $dhcp = @{
+        Scopes         = @($Zustand.Dhcp.Scopes | ForEach-Object {
+                @{
+                    ScopeId        = $_.ScopeId
+                    Name           = $_.Name
+                    Start          = $_.Start
+                    Ende           = $_.Ende
+                    Maske          = $_.Maske
+                    LeaseTage      = $_.LeaseTage
+                    Aktiv          = $_.Aktiv
+                    Optionen       = $_.Optionen
+                    Ausschluesse   = @($_.Ausschluesse)
+                    Reservierungen = @($_.Reservierungen)
+                }
+            })
+        ServerOptionen = $Zustand.Dhcp.ServerOptionen
+        DnsEinstellung = $(if ($Zustand.Dhcp.DnsEinstellung) { $Zustand.Dhcp.DnsEinstellung } else { @{} })
+    }
+    return @{ AD = $ad; Dns = $dns; Dhcp = $dhcp }
+}
+#
+function Import-NetExistingConfig {
+    <#
+    .SYNOPSIS
+        Menuepunkt "Vorhandene Konfiguration uebernehmen" (nur Config, keine Aenderung am Server).
+    #>
+    $zustand = Get-NetSetupState
+    $neu = ConvertTo-NetConfigFromState -Zustand $zustand
+    $alt = $script:NS.Config
+    $vorher = @{
+        'AD-Domaene'          = [string]$alt.AD.Domaene
+        'DNS-Zonen'           = @($alt.Dns.Zonen).Count
+        'DNS-Weiterleitungen' = (@($alt.Dns.Weiterleitungen) -join ', ')
+        'DHCP-Scopes'         = @($alt.Dhcp.Scopes).Count
+    }
+    $nachher = @{
+        'AD-Domaene'          = $neu.AD.Domaene
+        'DNS-Zonen'           = @($neu.Dns.Zonen).Count
+        'DNS-Weiterleitungen' = (@($neu.Dns.Weiterleitungen) -join ', ')
+        'DHCP-Scopes'         = @($neu.Dhcp.Scopes).Count
+    }
+    if (-not $zustand.Dns.Verfuegbar -and -not $zustand.Dhcp.Verfuegbar -and -not $neu.AD.Domaene) {
+        Write-Log -Level Warn -Message 'Es wurde keine vorhandene AD-, DNS- oder DHCP-Konfiguration gefunden. Es gibt nichts zu uebernehmen.'
+        return
+    }
+    $r = Invoke-NetChange -Titel 'Vorhandene Konfiguration in die NetSetup-Konfiguration uebernehmen' -Stufe Bestaetigen -Vorher $vorher -Nachher $nachher `
+        -Hinweis 'Am Server wird dabei nichts geaendert. Nur die Datei Config\netsetup.json wird aktualisiert.' -BackupBereich @('Config') -Aktion {
+        $c = $script:NS.Config
+        $c.AD.Domaene = $neu.AD.Domaene
+        $c.AD.NetBios = $neu.AD.NetBios
+        $c.Dns = $neu.Dns
+        $c.Dhcp = $neu.Dhcp
+        Save-NetConfig -Config $c
+    }
+    if ($r.Erfolg -and -not $r.Probelauf) { Write-Log -Level OK -Message 'Konfiguration uebernommen.' }
+}
+#
+function Show-NetInventoryMenu {
+    $eintraege = @(
+        @{ Text = 'Bestandsaufnahme neu erfassen (Uebersicht)'; Aktion = 'Show-NetStartOverview'; Hilfe = 'Liest den aktuellen Zustand des Servers neu ein (nur lesend) und zeigt pro Bereich eine Zeile mit [OK], [WARN], [FEHLER] oder [--].' },
+        @{ Text = 'Bestandsaufnahme im Detail'; Aktion = 'Show-NetStateDetail'; Hilfe = 'Zeigt alles, was NetSetup erkannt hat: Rolle, Funktionen, Dienste, Netzwerkkarten, DNS-Zonen, DHCP-Scopes, Failover, Zeitquelle.' },
+        @{ Text = 'Vorhandene Konfiguration uebernehmen'; Aktion = 'Import-NetExistingConfig'; Hilfe = "Schreibt die gefundenen DNS- und DHCP-Einstellungen in die NetSetup-Konfiguration (Config\netsetup.json).`nAm Server wird dabei nichts geaendert. Sinnvoll, wenn DNS/DHCP schon eingerichtet sind." }
+    )
+    Show-NetMenu -Titel 'Bestandsaufnahme' -Eintraege $eintraege
+}
+# ----------------------------------------------------------------------
+# src/ui/Ersteinrichtung.ps1
+# ----------------------------------------------------------------------
+# Ersteinrichtungs-Assistent: entscheidet anhand der Bestandsaufnahme die noetigen Schritte
+# (AD -> DNS -> DHCP -> Verbindung -> Test), ueberspringt Erledigtes und ruft die Funktionen
+# der einzelnen Bereiche auf. Fehlende Bereiche erscheinen als "kommt noch".
+#
+function Get-NetFirstSetupStep {
+    <#
+    .SYNOPSIS
+        Liefert die Schritte der Ersteinrichtung mit Status (erledigt oder offen).
+    #>
+    param([Parameter(Mandatory = $true)][hashtable]$Zustand)
+    $s = $Zustand.System
+    $modus = [string](Get-NetConfigValue -Pfad 'AD.Modus' -Standard '')
+    $forward = @($Zustand.Dns.Zonen | Where-Object { -not $_.Reverse -and $_.Typ -eq 'Primary' })
+    $reverse = @($Zustand.Dns.Zonen | Where-Object { $_.Reverse })
+    $aktiveScopes = @($Zustand.Dhcp.Scopes | Where-Object { $_.Aktiv })
+    $e = $Zustand.Dhcp.DnsEinstellung
+#
+    $adText = 'Domaenencontroller einrichten oder Domaene beitreten'
+    if ($s.IstDC) { $adText = 'Domaenencontroller fuer ' + $Zustand.AD.Domaene }
+    elseif ($modus -eq 'OhneAD') { $adText = 'bewusst ohne AD' }
+    elseif ($modus -eq 'Mitglied') { $adText = 'Mitgliedsserver, nur DNS/DHCP' }
+#
+    $dnsErledigt = $Zustand.Dns.Verfuegbar -and $Zustand.Dns.Laeuft -and ($forward.Count -gt 0) -and ($reverse.Count -gt 0)
+    $dhcpErledigt = $Zustand.Dhcp.Verfuegbar -and $Zustand.Dhcp.Laeuft -and $Zustand.Dhcp.Nachkonfiguriert -and
+        ((-not $Zustand.Dhcp.InDomaene) -or $Zustand.Dhcp.Autorisiert) -and ($aktiveScopes.Count -gt 0)
+    $verbindungErledigt = $Zustand.Dhcp.Verfuegbar -and $e -and ($e.DynamicUpdates -eq 'Always') -and $e.DeleteDnsRROnLeaseExpiry -and
+        ((-not $s.IstDC) -or $Zustand.Dhcp.DnsZugangsdaten.Gesetzt)
+#
+    return @(
+        [pscustomobject]@{ Nr = 1; Name = 'Active Directory'; Funktion = 'Start-NetAdSetup'; Erledigt = [bool]($s.IstDC -or $modus -eq 'OhneAD' -or $modus -eq 'Mitglied'); Text = $adText },
+        [pscustomobject]@{ Nr = 2; Name = 'DNS'; Funktion = 'Start-NetDnsSetup'; Erledigt = [bool]$dnsErledigt; Text = ('{0} Zone(n), {1} Reverse-Zone(n)' -f $forward.Count, $reverse.Count) },
+        [pscustomobject]@{ Nr = 3; Name = 'DHCP'; Funktion = 'Start-NetDhcpSetup'; Erledigt = [bool]$dhcpErledigt; Text = ('{0} aktive(r) Scope(s)' -f $aktiveScopes.Count) },
+        [pscustomobject]@{ Nr = 4; Name = 'DHCP + DNS verbinden'; Funktion = 'Start-NetIntegrationSetup'; Erledigt = [bool]$verbindungErledigt; Text = 'Clients automatisch mit A- und PTR-Eintrag' },
+        [pscustomobject]@{ Nr = 5; Name = 'Test (Doktor)'; Funktion = 'Invoke-NetDoctor'; Erledigt = $false; Text = 'alles pruefen und Fehler beheben' }
+    )
+}
+#
+function Show-NetFirstSetupPlan {
+    param([Parameter(Mandatory = $true)][object[]]$Schritte)
+    foreach ($s in $Schritte) {
+        if ($s.Erledigt) { Write-NetStatus -Status OK -Bereich ('{0}. {1}' -f $s.Nr, $s.Name) -Text ('erledigt - ' + $s.Text) }
+        elseif (-not (Test-NetCommand -Name $s.Funktion)) { Write-NetStatus -Status NA -Bereich ('{0}. {1}' -f $s.Nr, $s.Name) -Text 'offen - kommt in einer spaeteren Version' }
+        else { Write-NetStatus -Status WARN -Bereich ('{0}. {1}' -f $s.Nr, $s.Name) -Text ('offen - ' + $s.Text) }
+    }
+}
+#
+function Start-NetFirstSetup {
+    <#
+    .SYNOPSIS
+        Fuehrt durch die komplette Einrichtung und ueberspringt bereits Erledigtes.
+    #>
+    Write-NetTitle -Titel 'Ersteinrichtung'
+    Write-NetText -Text "Der Assistent prueft den Server und fuehrt nur die noch offenen Schritte aus:`n  1. Active Directory  2. DNS  3. DHCP  4. DHCP + DNS verbinden  5. Test`nJeder Schritt zeigt vorher, was er aendert, und fragt nach." -Farbe White
+    $uebersprungen = @()
+    $versuche = @{}
+    while ($true) {
+        $zustand = Get-NetSetupState
+        $schritte = @(Get-NetFirstSetupStep -Zustand $zustand)
+        Write-Host ''
+        Show-NetFirstSetupPlan -Schritte $schritte
+        $naechster = $schritte | Where-Object { -not $_.Erledigt -and ($uebersprungen -notcontains $_.Nr) } | Select-Object -First 1
+        if (-not $naechster) {
+            Write-Log -Level OK -Message 'Die Ersteinrichtung ist abgeschlossen (bzw. alle offenen Schritte wurden uebersprungen).'
+            return
+        }
+        if (-not (Test-NetCommand -Name $naechster.Funktion)) {
+            Write-Log -Level Warn -Message ('Schritt {0} ({1}) kommt in einer spaeteren Version und wird uebersprungen.' -f $naechster.Nr, $naechster.Name)
+            $uebersprungen += $naechster.Nr
+            continue
+        }
+        $versuche[$naechster.Nr] = 1 + [int]$versuche[$naechster.Nr]
+        if ($versuche[$naechster.Nr] -gt 1) {
+            Write-Log -Level Warn -Message ('Schritt {0} ({1}) ist noch nicht abgeschlossen.' -f $naechster.Nr, $naechster.Name)
+            $wahl = Read-NetChoice -Frage 'Wie weiter?' -Optionen @('Schritt erneut ausfuehren', 'Schritt ueberspringen', 'Assistent beenden') -Vorschlag 1
+            if ($wahl -eq 1) { $uebersprungen += $naechster.Nr; continue }
+            if ($wahl -ne 0) { return }
+        }
+        elseif (-not (Read-NetYesNo -Frage ('Naechster Schritt: {0}. {1}. Jetzt ausfuehren?' -f $naechster.Nr, $naechster.Name) -Vorschlag $true)) {
+            Write-Log -Message 'Assistent beendet. Er kann jederzeit erneut gestartet werden und macht dort weiter.'
+            return
+        }
+        $script:NS.AssistentAktiv = $true
+        try { & $naechster.Funktion }
+        catch { Write-NetError -Fehler $_ -Titel $naechster.Name | Out-Null }
+        finally { $script:NS.AssistentAktiv = $false }
+        if ($naechster.Nr -eq 5) { $uebersprungen += 5 }
+        if ($script:NS.NeustartGeplant) {
+            Write-Log -Message 'Nach dem Neustart setzt NetSetup den Assistenten automatisch fort.'
+            return
+        }
+    }
+}
+# ----------------------------------------------------------------------
 # src/ui/Hauptmenue.ps1
 # ----------------------------------------------------------------------
 # Hauptmenue mit allen geplanten Punkten. Noch nicht gebaute Punkte erscheinen als "kommt noch".
@@ -2192,6 +2999,11 @@ function Get-NetMainMenuEntry {
             Text   = 'Ersteinrichtung (Assistent)'
             Aktion = 'Start-NetFirstSetup'
             Hilfe  = "Fuehrt Schritt fuer Schritt durch die komplette Einrichtung: AD -> DNS -> DHCP -> Verbindung DHCP/DNS -> Test.`nNetSetup erkennt, was schon erledigt ist, und ueberspringt es. Ideal fuer einen neuen Server."
+        },
+        @{
+            Text   = 'Bestandsaufnahme (Zustand des Servers)'
+            Aktion = 'Show-NetInventoryMenu'
+            Hilfe  = "Zeigt, was auf dem Server schon eingerichtet ist: Rolle, Funktionen, Dienste, Netzwerk, DNS, DHCP, Zeit.`nNur lesend. Kann gefundene DNS-/DHCP-Einstellungen in die NetSetup-Konfiguration uebernehmen."
         },
         @{
             Text   = 'Active Directory'
