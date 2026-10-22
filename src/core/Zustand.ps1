@@ -25,4 +25,5 @@ $script:NS = @{
     AssistentAktiv  = $false
     NeustartGeplant = $false
     LetzterDoktor   = $null
+    ErweitertFrei   = $false
 }
