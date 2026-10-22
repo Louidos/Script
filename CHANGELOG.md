@@ -5,6 +5,8 @@ Format nach [Keep a Changelog](https://keepachangelog.com/de/1.1.0/), Versionen 
 
 ## Unveröffentlicht
 
+## 0.1.0 – 2026-10-22
+
 ### Hinzugefügt
 - Projektstruktur, README, Lizenz und automatische Prüfung (CI) für jede Änderung (#1)
 - Einfügbares Script `dist/NetSetup.ps1` mit Hauptmenü, Hilfe zu jedem Punkt, Glossar, Logging und Probelauf; speichert sich selbst nach `C:\NetSetup`, prüft Adminrechte und Windows-Server-Version und bietet eine Desktop-Verknüpfung an (#2)
