@@ -1,5 +1,5 @@
 <#
-    NetSetup 0.0.0 (Build 2026-10-22 22:05)
+    NetSetup 0.0.0 (Build 2026-10-22 22:15)
     AD, DNS und DHCP auf Windows Server einrichten, verwalten und reparieren.
 #
     So starten (PowerShell oder PowerShell ISE als Administrator):
@@ -14,7 +14,7 @@
 #>
 $NetSetupCode = {
 $script:NetSetupVersion = '0.0.0'
-$script:NetSetupBuildDatum = '2026-10-22 22:05'
+$script:NetSetupBuildDatum = '2026-10-22 22:15'
 # ----------------------------------------------------------------------
 # src/core/Zustand.ps1
 # ----------------------------------------------------------------------
@@ -1165,7 +1165,9 @@ function Test-NetUndoCommand {
     $cmd = Get-Command -Name $Befehl -ErrorAction SilentlyContinue
     if (-not $cmd) { return $false }
     if ($cmd.CommandType -eq 'Function' -and $Befehl -match '^[A-Za-z]+-Net') { return $true }
-    return ($script:NetUndoModule -contains [string]$cmd.ModuleName)
+    if ($script:NetUndoModule -contains [string]$cmd.ModuleName) { return $true }
+    # Befehle der Server-Module auch am Namen erkennen (z. B. wenn das Modul anders geladen wurde).
+    return ($Befehl -match '^[A-Za-z]+-(DnsServer|DhcpServer|NetIPAddress|NetIPInterface|NetRoute|DnsClient|NetFirewall|AD[A-Z]|WindowsFeature|ScheduledTask|Item$|ItemProperty$|Computer$)')
 }
 #
 function Undo-NetChange {
@@ -1567,7 +1569,13 @@ function Read-NetText {
         [scriptblock]$Pruefung,
         [switch]$LeerErlaubt
     )
+    $versuche = 0
     while ($true) {
+        $versuche++
+        if ($versuche -gt 25) {
+            Write-Log -Level Warn -Message 'Zu viele ungueltige Eingaben, Abbruch.'
+            return $null
+        }
         $prompt = $Frage
         if ($Vorschlag) { $prompt += " [$Vorschlag]" }
         $antwort = Read-NetInput -Prompt $prompt
@@ -7848,6 +7856,926 @@ Register-NetCheck @{
         New-NetCheckResult OK 'Always, Loeschen bei Ablauf, aeltere Clients'
     }
     Reparatur     = { Set-NetDhcpDnsSetting | Out-Null }
+}
+# ----------------------------------------------------------------------
+# src/wartung/Backup.ps1
+# ----------------------------------------------------------------------
+# Backup: DHCP (Backup-DhcpServer und Export-DhcpServer mit Leases), DNS (Export-DnsServerZone pro Zone
+# und alle Eintraege als CSV), Konfiguration und Netzwerk. Automatisch vor jeder Aenderung,
+# Aufbewahrung der letzten N Backups (Einstellung, Vorschlag 20).
+#
+$script:NetBackupBereiche = @('Dhcp', 'Dns', 'Config', 'Netzwerk')
+#
+function Get-NetWindowsPath {
+    param([string]$Unterpfad)
+    $windows = $env:SystemRoot
+    if (-not $windows) { $windows = 'C:\Windows' }
+    return ($windows.TrimEnd('\') + '\' + $Unterpfad.TrimStart('\'))
+}
+#
+function Get-NetBackupList {
+    <#
+    .SYNOPSIS
+        Liefert alle Backups (neueste zuerst) mit Zeit, Anlass und enthaltenen Bereichen.
+    #>
+    $ordner = Get-NetPath -Name Backups
+    if (-not (Test-Path -Path $ordner)) { return @() }
+    $liste = @()
+    foreach ($d in @(Get-ChildItem -Path $ordner -Directory | Sort-Object -Property Name -Descending)) {
+        $info = Join-Path -Path $d.FullName -ChildPath 'info.json'
+        if (-not (Test-Path -Path $info)) { continue }
+        try { $i = Get-Content -Path $info -Raw | ConvertFrom-Json } catch { continue }
+        $liste += [pscustomobject]@{
+            Name      = $d.Name
+            Pfad      = $d.FullName
+            Zeit      = [string]$i.Zeit
+            Anlass    = [string]$i.Anlass
+            Bereiche  = @($i.Bereiche)
+            Server    = [string]$i.Server
+            Automatisch = [bool]$i.Automatisch
+        }
+    }
+    return $liste
+}
+#
+function Remove-NetOldBackup {
+    <#
+    .SYNOPSIS
+        Loescht die aeltesten Backups, wenn mehr als die eingestellte Anzahl vorhanden sind.
+    #>
+    $behalten = [int](Get-NetConfigValue -Pfad 'Allgemein.BackupAufbewahrung' -Standard 20)
+    $liste = @(Get-NetBackupList | Where-Object { $_.Name -notlike 'Umzug_*' })
+    if ($liste.Count -le $behalten) { return }
+    foreach ($alt in ($liste | Select-Object -Skip $behalten)) {
+        Remove-Item -Path $alt.Pfad -Recurse -Force -ErrorAction SilentlyContinue
+        Write-Log -Level Debug -Message ('Altes Backup geloescht: ' + $alt.Name)
+    }
+}
+#
+function Export-NetDnsRecordCsv {
+    <#
+    .SYNOPSIS
+        Schreibt alle Eintraege der Zonen als CSV (mit Daten als JSON, fuer die Wiederherstellung).
+    #>
+    param([Parameter(Mandatory = $true)][string]$Datei, [string[]]$Zonen)
+    if (-not $Zonen) { $Zonen = @(Get-NetDnsZoneInfo -Art Primaer | ForEach-Object { $_.Name }) }
+    $zeilen = @()
+    foreach ($zone in $Zonen) {
+        foreach ($e in @(Get-NetDnsRecord -Zone $zone)) {
+            $zeilen += [pscustomobject]@{
+                Zone     = $e.Zone
+                Name     = $e.Name
+                Typ      = $e.Typ
+                Wert     = $e.Wert
+                Statisch = $e.Statisch
+                Ttl      = $e.Ttl
+                Daten    = ($e.Daten | ConvertTo-Json -Compress -Depth 3)
+            }
+        }
+    }
+    $zeilen | Export-Csv -Path $Datei -NoTypeInformation -Encoding UTF8 -Delimiter ';'
+    return $zeilen.Count
+}
+#
+function Backup-NetSetupData {
+    <#
+    .SYNOPSIS
+        Erstellt ein Backup der gewaehlten Bereiche. Liefert den Ordner (oder $null bei Fehler).
+    .PARAMETER Bereich
+        Dhcp, Dns, Config, Netzwerk (AD wird mit der Windows-Serversicherung gesichert).
+    #>
+    param(
+        [string[]]$Bereich = $script:NetBackupBereiche,
+        [string]$Anlass = 'manuell',
+        [switch]$Automatisch,
+        [string]$Ziel
+    )
+    $zeit = Get-Date
+    $kurz = ($Anlass -replace '[^A-Za-z0-9]+', '-').Trim('-')
+    if ($kurz.Length -gt 40) { $kurz = $kurz.Substring(0, 40) }
+    if (-not $Ziel) { $Ziel = Join-Path -Path (Get-NetPath -Name Backups) -ChildPath ('{0}_{1}' -f $zeit.ToString('yyyyMMdd_HHmmss_fff'), $kurz) }
+    New-Item -Path $Ziel -ItemType Directory -Force | Out-Null
+    $erledigt = @()
+    $hinweise = @()
+    foreach ($b in @($Bereich | Select-Object -Unique)) {
+        switch ($b) {
+            'Config' {
+                $datei = Get-NetPath -Name ConfigDatei
+                if (Test-Path -Path $datei) { Copy-Item -Path $datei -Destination (Join-Path -Path $Ziel -ChildPath 'netsetup.json') -Force }
+                $verlauf = Get-NetPath -Name Verlauf
+                if (Test-Path -Path $verlauf) { Copy-Item -Path $verlauf -Destination (Join-Path -Path $Ziel -ChildPath 'verlauf.json') -Force }
+                $erledigt += 'Config'
+            }
+            'Netzwerk' {
+                $netz = Get-NetNetworkState
+                Set-Content -Path (Join-Path -Path $Ziel -ChildPath 'netzwerk.json') -Value ($netz | ConvertTo-Json -Depth 8) -Encoding UTF8
+                $erledigt += 'Netzwerk'
+            }
+            'Dhcp' {
+                if (-not (Test-NetDhcpReady -Still)) { $hinweise += 'DHCP: nicht vorhanden oder Dienst gestoppt - uebersprungen'; continue }
+                $dhcpZiel = Join-Path -Path $Ziel -ChildPath 'Dhcp'
+                New-Item -Path $dhcpZiel -ItemType Directory -Force | Out-Null
+                Export-DhcpServer -File (Join-Path -Path $dhcpZiel -ChildPath 'dhcp-export.xml') -Leases -Force
+                # Backup-DhcpServer schreibt der DHCP-Dienst selbst (NetworkService): erst in seinen Ordner, dann kopieren.
+                $dienstOrdner = Get-NetWindowsPath -Unterpfad 'System32\dhcp\NetSetupBackup'
+                if (Test-Path -Path $dienstOrdner) { Remove-Item -Path $dienstOrdner -Recurse -Force -ErrorAction SilentlyContinue }
+                Backup-DhcpServer -Path $dienstOrdner
+                Copy-Item -Path $dienstOrdner -Destination (Join-Path -Path $dhcpZiel -ChildPath 'Datenbank') -Recurse -Force
+                $erledigt += 'Dhcp'
+            }
+            'Dns' {
+                if (-not (Test-NetDnsReady -Still)) { $hinweise += 'DNS: nicht vorhanden oder Dienst gestoppt - uebersprungen'; continue }
+                $dnsZiel = Join-Path -Path $Ziel -ChildPath 'Dns'
+                New-Item -Path $dnsZiel -ItemType Directory -Force | Out-Null
+                $zonen = @(Get-NetDnsZoneInfo -Art Primaer)
+                $stempel = $zeit.ToString('yyyyMMddHHmmss')
+                foreach ($z in $zonen) {
+                    $dateiName = 'NetSetup_{0}_{1}.dns' -f ($z.Name -replace '[^A-Za-z0-9.-]', '_'), $stempel
+                    try {
+                        Export-DnsServerZone -Name $z.Name -FileName $dateiName
+                        $quelle = Get-NetWindowsPath -Unterpfad ('System32\dns\' + $dateiName)
+                        if (Test-Path -Path $quelle) { Move-Item -Path $quelle -Destination (Join-Path -Path $dnsZiel -ChildPath $dateiName) -Force }
+                    }
+                    catch { $hinweise += ('DNS: Zone {0} konnte nicht exportiert werden ({1})' -f $z.Name, $_.Exception.Message) }
+                }
+                Set-Content -Path (Join-Path -Path $dnsZiel -ChildPath 'zonen.json') -Value (ConvertTo-Json -InputObject @($zonen) -Depth 4) -Encoding UTF8
+                $anzahl = Export-NetDnsRecordCsv -Datei (Join-Path -Path $dnsZiel -ChildPath 'eintraege.csv') -Zonen @($zonen | ForEach-Object { $_.Name })
+                $einst = @{ Weiterleitungen = @(Get-NetDnsForwarderList) }
+                Set-Content -Path (Join-Path -Path $dnsZiel -ChildPath 'einstellungen.json') -Value ($einst | ConvertTo-Json -Depth 4) -Encoding UTF8
+                Write-Log -Level Debug -Message "DNS-Backup: $($zonen.Count) Zonen, $anzahl Eintraege"
+                $erledigt += 'Dns'
+            }
+            default { $hinweise += "Bereich $b wird nicht gesichert (AD: Windows-Serversicherung verwenden)." }
+        }
+    }
+    $info = @{ Zeit = $zeit.ToString('yyyy-MM-dd HH:mm:ss'); Anlass = $Anlass; Bereiche = $erledigt; Hinweise = $hinweise; Server = [Environment]::MachineName; Version = $script:NS.Version; Automatisch = [bool]$Automatisch }
+    Set-Content -Path (Join-Path -Path $Ziel -ChildPath 'info.json') -Value ($info | ConvertTo-Json -Depth 4) -Encoding UTF8
+    foreach ($h in $hinweise) { Write-Log -Level Debug -Message ('Backup: ' + $h) }
+    if ($Automatisch) { Write-Log -Message ('Backup erstellt ({0}): {1}' -f ($erledigt -join ', '), (Split-Path -Path $Ziel -Leaf)) }
+    else { Write-Log -Level OK -Message ('Backup erstellt ({0}): {1}' -f ($erledigt -join ', '), $Ziel) }
+    Remove-NetOldBackup
+    return $Ziel
+}
+#
+function Invoke-NetBackupNow {
+    $i = Read-NetChoice -Frage 'Was sichern?' -Optionen @('Alles (DHCP, DNS, Konfiguration, Netzwerk)', 'Nur DHCP', 'Nur DNS', 'Nur Konfiguration') -Vorschlag 1
+    if ($i -lt 0) { return }
+    $bereiche = switch ($i) { 0 { $script:NetBackupBereiche } 1 { @('Dhcp') } 2 { @('Dns') } default { @('Config') } }
+    $r = Invoke-NetStep -Titel 'Backup' -Aktion { Backup-NetSetupData -Bereich $bereiche -Anlass 'manuell' }
+    if ($r.Erfolg) { Write-NetText -Text ('Ordner: ' + $r.Ergebnis) }
+}
+#
+function Invoke-NetBackupTask {
+    <#
+    .SYNOPSIS
+        Aufgabe ohne Menue (-Task Backup).
+    #>
+    Backup-NetSetupData -Bereich $script:NetBackupBereiche -Anlass 'Aufgabe' | Out-Null
+}
+#
+function Show-NetBackupList {
+    Write-NetTitle -Titel 'Backups'
+    $liste = @(Get-NetBackupList)
+    if ($liste.Count -eq 0) { Write-Log -Message 'Noch keine Backups vorhanden.'; return }
+    foreach ($b in $liste) { Write-Host ('  {0,-19} {1,-28} {2,-30} {3}' -f $b.Zeit, ($b.Bereiche -join ','), $b.Anlass, $(if ($b.Automatisch) { 'automatisch' } else { '' })) }
+    Write-Host ('  Ordner: ' + (Get-NetPath -Name Backups)) -ForegroundColor DarkGray
+}
+# ----------------------------------------------------------------------
+# src/wartung/Wiederherstellen.ps1
+# ----------------------------------------------------------------------
+# Wiederherstellen (Stufe Gefaehrlich) und Rueckgaengig.
+# DHCP: Restore-DhcpServer (Datenbank) oder Import-DhcpServer (Export-Datei).
+# DNS: Eintraege aus der CSV neu anlegen (vorhandene bleiben, nichts wird doppelt angelegt).
+#
+function Select-NetBackup {
+    param([Parameter(Mandatory = $true)][string]$Bereich, [string]$Titel = 'Backup waehlen')
+    $liste = @(Get-NetBackupList | Where-Object { $_.Bereiche -contains $Bereich })
+    if ($liste.Count -eq 0) { Write-Log -Level Warn -Message "Es gibt kein Backup mit dem Bereich $Bereich."; return $null }
+    return (Select-NetItem -Elemente $liste -Titel $Titel -Eigenschaften @('Zeit', 'Anlass', 'Bereiche', 'Server'))
+}
+#
+function Restore-NetDhcpBackup {
+    <#
+    .SYNOPSIS
+        Stellt DHCP aus einem Backup wieder her (Gefaehrlich: vorher wird der aktuelle Stand gesichert).
+    #>
+    if (-not (Test-NetCommand -Name 'Restore-DhcpServer')) { Write-Log -Level Fehler -Message 'Die DHCP-Verwaltungstools fehlen (RSAT-DHCP).'; return $false }
+    $b = Select-NetBackup -Bereich 'Dhcp' -Titel 'Aus welchem Backup wiederherstellen?'
+    if (-not $b) { return $false }
+    $art = Read-NetChoice -Frage 'Wie wiederherstellen?' -Optionen @(
+        'Datenbank zuruecksetzen (Restore-DhcpServer) - alles wie zum Zeitpunkt des Backups, Dienst wird neu gestartet',
+        'Konfiguration importieren (Import-DhcpServer) - Scopes, Optionen, Reservierungen und Leases werden ueberschrieben') -Vorschlag 1
+    if ($art -lt 0) { return $false }
+    $quelle = Join-Path -Path $b.Pfad -ChildPath 'Dhcp'
+    $datenbank = Join-Path -Path $quelle -ChildPath 'Datenbank'
+    $export = Join-Path -Path $quelle -ChildPath 'dhcp-export.xml'
+    $r = Invoke-NetChange -Titel ('DHCP aus dem Backup vom {0} wiederherstellen' -f $b.Zeit) -Stufe Gefaehrlich -Vorher 'aktueller DHCP-Stand (wird vorher gesichert)' -Nachher ('Stand vom {0} ({1})' -f $b.Zeit, $b.Anlass) -BackupBereich @('Dhcp') `
+        -Hinweis 'Alle Aenderungen seit dem Backup gehen verloren. Clients behalten ihre Adressen bis zur naechsten Erneuerung.' -Aktion {
+        if ($art -eq 0) {
+            $dienstOrdner = Get-NetWindowsPath -Unterpfad 'System32\dhcp\NetSetupRestore'
+            if (Test-Path -Path $dienstOrdner) { Remove-Item -Path $dienstOrdner -Recurse -Force }
+            Copy-Item -Path $datenbank -Destination $dienstOrdner -Recurse -Force
+            Restore-DhcpServer -Path $dienstOrdner -Force
+            Restart-Service -Name DHCPServer -Force
+        }
+        else {
+            $arbeit = Get-NetWindowsPath -Unterpfad 'System32\dhcp\NetSetupImport'
+            Import-DhcpServer -File $export -BackupPath $arbeit -Leases -ScopeOverwrite -Force
+        }
+    }
+    return [bool]($r.Erfolg -and -not $r.Probelauf)
+}
+#
+function Get-NetDnsBackupRecord {
+    param([Parameter(Mandatory = $true)][string]$Pfad)
+    $datei = Join-Path -Path (Join-Path -Path $Pfad -ChildPath 'Dns') -ChildPath 'eintraege.csv'
+    if (-not (Test-Path -Path $datei)) { return @() }
+    $liste = @()
+    foreach ($z in @(Import-Csv -Path $datei -Delimiter ';')) {
+        $daten = @{}
+        if ($z.Daten) { try { $daten = ConvertTo-NetHashtable -Objekt ($z.Daten | ConvertFrom-Json) } catch { $daten = @{} } }
+        $liste += [pscustomobject]@{ Zone = $z.Zone; Name = $z.Name; Typ = $z.Typ; Wert = $z.Wert; Daten = $daten; Statisch = ($z.Statisch -eq 'True') }
+    }
+    return $liste
+}
+#
+function Restore-NetDnsBackup {
+    <#
+    .SYNOPSIS
+        Legt DNS-Eintraege aus der CSV eines Backups neu an (nur fehlende; fehlende Zonen auf Wunsch).
+    #>
+    if (-not (Test-NetDnsReady)) { return $false }
+    $b = Select-NetBackup -Bereich 'Dns' -Titel 'Aus welchem Backup wiederherstellen?'
+    if (-not $b) { return $false }
+    $alle = @(Get-NetDnsBackupRecord -Pfad $b.Pfad | Where-Object { $script:NetDnsTypen -contains $_.Typ })
+    $zonen = @($alle | ForEach-Object { $_.Zone } | Select-Object -Unique)
+    $wahl = @(Select-NetItem -Elemente $zonen -Titel 'Welche Zonen wiederherstellen?' -Mehrfach)
+    if ($wahl.Count -eq 0) { return $false }
+    $vorhandeneZonen = @(Get-NetDnsZoneInfo | ForEach-Object { $_.Name })
+    $plan = @()
+    $neueZonen = @()
+    foreach ($zone in $wahl) {
+        if ($vorhandeneZonen -notcontains $zone) { $neueZonen += $zone }
+        $jetzt = @()
+        if ($vorhandeneZonen -contains $zone) { $jetzt = @(Get-NetDnsRecord -Zone $zone) }
+        foreach ($e in @($alle | Where-Object { $_.Zone -eq $zone })) {
+            $gleich = @($jetzt | Where-Object { $_.Name -eq $e.Name -and $_.Typ -eq $e.Typ -and (Test-NetDnsRecordEqual -A $e.Daten -B $_.Daten) })
+            if ($gleich.Count -eq 0 -and $e.Daten.Count -gt 0) { $plan += $e }
+        }
+    }
+    if ($plan.Count -eq 0 -and $neueZonen.Count -eq 0) { Write-Log -Level OK -Message 'Alle Eintraege aus dem Backup sind vorhanden. Nichts zu tun.'; return $true }
+    $speicherung = $null
+    if ($neueZonen.Count -gt 0) {
+        Write-Log -Message ('Diese Zonen fehlen und werden angelegt: ' + ($neueZonen -join ', '))
+        $speicherung = Read-NetDnsZoneStorage
+        if (-not $speicherung) { return $false }
+    }
+    $rueck = @($plan | ForEach-Object { @{ Befehl = 'Remove-NetDnsRecordExact'; Parameter = @{ ZoneName = $_.Zone; Name = $_.Name; Typ = $_.Typ; Daten = $_.Daten } } })
+    $r = Invoke-NetChange -Titel ('DNS aus dem Backup vom {0} wiederherstellen' -f $b.Zeit) -Stufe Gefaehrlich -Vorher ('{0} Eintraege fehlen' -f $plan.Count) -Nachher (@($neueZonen | ForEach-Object { 'Zone ' + $_ }) + @($plan | Select-Object -First 30 | ForEach-Object { '{0} {1} {2} in {3}' -f $_.Name, $_.Typ, $_.Wert, $_.Zone })) -BackupBereich @('Dns') -Aktion {
+        foreach ($zone in $neueZonen) {
+            $p = @{ Name = $zone; DynamicUpdate = $speicherung.Updates }
+            if ($speicherung.AdIntegriert) { $p.ReplicationScope = $speicherung.Replikation } else { $p.ZoneFile = $zone + '.dns' }
+            Add-DnsServerPrimaryZone @p
+        }
+        foreach ($e in $plan) { Add-NetDnsRecordExact -ZoneName $e.Zone -Name $e.Name -Typ $e.Typ -Daten $e.Daten }
+    } -Rueckgaengig $rueck
+    return [bool]($r.Erfolg -and -not $r.Probelauf)
+}
+#
+function Undo-NetLastChange {
+    $offen = @(Get-NetUndoEntry -NurOffen)
+    if ($offen.Count -eq 0) { Write-Log -Message 'Es gibt keine Aenderung, die rueckgaengig gemacht werden kann.'; return }
+    Write-Log -Message ('Letzte Aenderung: {0} ({1})' -f $offen[0].Titel, $offen[0].Zeit)
+    Undo-NetChange -Id $offen[0].Id | Out-Null
+}
+#
+function Undo-NetSelectedChange {
+    $offen = @(Get-NetUndoEntry -NurOffen | ForEach-Object { [pscustomobject]@{ Id = $_.Id; Zeit = $_.Zeit; Titel = $_.Titel; Benutzer = $_.Benutzer } })
+    $w = Select-NetItem -Elemente $offen -Titel 'Welche Aenderung rueckgaengig machen?' -Eigenschaften @('Zeit', 'Titel', 'Benutzer')
+    if ($w) {
+        $spaeter = @($offen | Where-Object { $_.Zeit -gt $w.Zeit })
+        if ($spaeter.Count -gt 0) { Write-Log -Level Warn -Message ('Danach gab es {0} weitere Aenderung(en). Diese bleiben bestehen und koennten von der alten Einstellung abhaengen.' -f $spaeter.Count) }
+        Undo-NetChange -Id $w.Id | Out-Null
+    }
+}
+#
+function Show-NetChangeHistory {
+    Write-NetTitle -Titel 'Aenderungsverlauf'
+    $liste = @(Get-NetUndoEntry)
+    if ($liste.Count -eq 0) { Write-Log -Message 'Noch keine Aenderungen.'; return }
+    foreach ($e in $liste) {
+        $farbe = 'Gray'
+        if ($e.Status -ne 'Offen') { $farbe = 'DarkGray' }
+        Write-Host ('  {0}  {1,-12} {2}' -f $e.Zeit, $e.Status, $e.Titel) -ForegroundColor $farbe
+    }
+}
+# ----------------------------------------------------------------------
+# src/wartung/Umzug.ps1
+# ----------------------------------------------------------------------
+# Serverumzug: Paket exportieren (DHCP mit Leases, DNS-Zonen und -Eintraege, Konfiguration)
+# und auf dem Zielserver mit Bestandsaufnahme und Vorher/Nachher importieren.
+#
+function Export-NetMigrationPackage {
+    <#
+    .SYNOPSIS
+        Erstellt ein Umzugspaket im Ordner Backups (Umzug_<Server>_<Zeit>), optional als ZIP.
+    #>
+    $z = Get-NetSetupState
+    $ziel = Join-Path -Path (Get-NetPath -Name Backups) -ChildPath ('Umzug_{0}_{1}' -f [Environment]::MachineName, (Get-Date -Format 'yyyyMMdd_HHmmss'))
+    $bereiche = @('Config')
+    if ($z.Dhcp.Verfuegbar) { $bereiche += 'Dhcp' }
+    if ($z.Dns.Verfuegbar) { $bereiche += 'Dns' }
+    $r = Invoke-NetStep -Titel 'Umzugspaket erstellen' -Aktion { Backup-NetSetupData -Bereich $bereiche -Anlass 'Umzug' -Ziel $ziel }
+    if (-not $r.Erfolg) { return $null }
+    Write-NetText -Text ("Paket: {0}`nDiesen Ordner (z. B. per Freigabe oder USB-Stick) auf den Zielserver kopieren und dort NetSetup -> Backup -> Umzug importieren." -f $ziel) -Farbe White
+    if ((Test-NetCommand -Name 'Compress-Archive') -and (Read-NetYesNo -Frage 'Zusaetzlich als ZIP-Datei verpacken?' -Vorschlag $true)) {
+        $zip = $ziel + '.zip'
+        Compress-Archive -Path (Join-Path -Path $ziel -ChildPath '*') -DestinationPath $zip -Force
+        Write-Log -Level OK -Message ('ZIP: ' + $zip)
+    }
+    return $ziel
+}
+#
+function Read-NetMigrationPackage {
+    <#
+    .SYNOPSIS
+        Liest ein Umzugspaket (Ordner oder ZIP) und liefert seinen Inhalt.
+    #>
+    param([Parameter(Mandatory = $true)][string]$Pfad)
+    if ($Pfad -like '*.zip') {
+        $entpackt = Join-Path -Path (Get-NetPath -Name Backups) -ChildPath ('Import_' + (Get-Date -Format 'yyyyMMdd_HHmmss'))
+        Expand-Archive -Path $Pfad -DestinationPath $entpackt -Force
+        $Pfad = $entpackt
+    }
+    $info = Join-Path -Path $Pfad -ChildPath 'info.json'
+    if (-not (Test-Path -Path $info)) { throw 'Kein gueltiges NetSetup-Paket (info.json fehlt).' }
+    $meta = Get-Content -Path $info -Raw | ConvertFrom-Json
+    $export = Join-Path -Path (Join-Path -Path $Pfad -ChildPath 'Dhcp') -ChildPath 'dhcp-export.xml'
+    $scopes = @()
+    if (Test-Path -Path $export) {
+        [xml]$xml = Get-Content -Path $export -Raw
+        foreach ($s in @($xml.SelectNodes('//IPv4/Scopes/Scope'))) {
+            $scopes += [pscustomobject]@{ ScopeId = [string]$s.ScopeId; Name = [string]$s.Name; Start = [string]$s.StartRange; Ende = [string]$s.EndRange }
+        }
+    }
+    $zonenDatei = Join-Path -Path (Join-Path -Path $Pfad -ChildPath 'Dns') -ChildPath 'zonen.json'
+    $zonen = @()
+    if (Test-Path -Path $zonenDatei) { $zonen = @(Get-Content -Path $zonenDatei -Raw | ConvertFrom-Json) }
+    return [pscustomobject]@{
+        Pfad      = $Pfad
+        Server    = [string]$meta.Server
+        Zeit      = [string]$meta.Zeit
+        Export    = $export
+        Scopes    = $scopes
+        Zonen     = $zonen
+        Eintraege = @(Get-NetDnsBackupRecord -Pfad $Pfad | Where-Object { $script:NetDnsTypen -contains $_.Typ })
+    }
+}
+#
+function Import-NetMigrationPackage {
+    <#
+    .SYNOPSIS
+        Importiert ein Umzugspaket auf diesem Server: Bestandsaufnahme, Vorher/Nachher, Gefaehrlich.
+        Vorhandene Scopes und Zonen werden nicht ueberschrieben.
+    #>
+    $pfad = Read-NetText -Frage 'Pfad zum Umzugspaket (Ordner oder ZIP)' -Pruefung { param($t) if (Test-Path -Path $t) { $null } else { 'Der Pfad existiert nicht.' } }
+    if (-not $pfad) { return $false }
+    $paket = $null
+    try { $paket = Read-NetMigrationPackage -Pfad $pfad }
+    catch { Write-NetError -Fehler $_ -Titel 'Umzugspaket lesen' | Out-Null; return $false }
+    Write-Log -Message ('Paket von {0} vom {1}.' -f $paket.Server, $paket.Zeit)
+    $z = Get-NetSetupState
+    $vorhandeneScopes = @($z.Dhcp.Scopes | ForEach-Object { $_.ScopeId })
+    $neueScopes = @($paket.Scopes | Where-Object { $vorhandeneScopes -notcontains $_.ScopeId })
+    $vorhandeneZonen = @($z.Dns.Zonen | ForEach-Object { $_.Name })
+    $neueZonen = @($paket.Zonen | Where-Object { $vorhandeneZonen -notcontains $_.Name -and -not $_.Name.StartsWith('_msdcs') })
+    foreach ($s in @($paket.Scopes | Where-Object { $vorhandeneScopes -contains $_.ScopeId })) { Write-Log -Level Warn -Message ('Scope {0} gibt es hier schon - wird nicht ueberschrieben.' -f $s.ScopeId) }
+    if ($neueScopes.Count -gt 0 -and -not (Test-NetDhcpReady)) { Write-Log -Level Warn -Message 'DHCP ist hier nicht bereit, die Scopes werden uebersprungen.'; $neueScopes = @() }
+    if ($neueZonen.Count -gt 0 -and -not (Test-NetDnsReady)) { Write-Log -Level Warn -Message 'DNS ist hier nicht bereit, die Zonen werden uebersprungen.'; $neueZonen = @() }
+    if ($neueScopes.Count -eq 0 -and $neueZonen.Count -eq 0) { Write-Log -Level OK -Message 'Alles aus dem Paket ist hier schon vorhanden. Nichts zu tun.'; return $true }
+    $speicherung = $null
+    if ($neueZonen.Count -gt 0) { $speicherung = Read-NetDnsZoneStorage; if (-not $speicherung) { return $false } }
+    $zonenNamen = @($neueZonen | ForEach-Object { $_.Name })
+    $eintraege = @($paket.Eintraege | Where-Object { $zonenNamen -contains $_.Zone -and $_.Daten.Count -gt 0 })
+    $scopeIds = @($neueScopes | ForEach-Object { $_.ScopeId })
+    $export = $paket.Export
+    $vorher = @{ Scopes = ($vorhandeneScopes -join ', '); Zonen = ($vorhandeneZonen -join ', ') }
+    $nachher = @{ 'Neue Scopes' = (($neueScopes | ForEach-Object { '{0} ({1})' -f $_.ScopeId, $_.Name }) -join ', '); 'Neue Zonen' = ($zonenNamen -join ', '); 'DNS-Eintraege' = $eintraege.Count }
+    $r = Invoke-NetChange -Titel ('Umzugspaket von {0} importieren' -f $paket.Server) -Stufe Gefaehrlich -Vorher $vorher -Nachher $nachher -BackupBereich @('Dhcp', 'Dns', 'Config') `
+        -Hinweis 'Nach dem Import den alten DHCP-Server deaktivieren, damit nicht zwei Server dieselben Adressen vergeben. Danach den Doktor ausfuehren (Autorisierung, Optionen 006).' -Aktion {
+        if ($scopeIds.Count -gt 0) {
+            $arbeit = Get-NetWindowsPath -Unterpfad 'System32\dhcp\NetSetupImport'
+            Import-DhcpServer -File $export -BackupPath $arbeit -ScopeId $scopeIds -Leases -Force
+        }
+        foreach ($zone in $zonenNamen) {
+            $p = @{ Name = $zone; DynamicUpdate = $speicherung.Updates }
+            if ($speicherung.AdIntegriert) { $p.ReplicationScope = $speicherung.Replikation } else { $p.ZoneFile = $zone + '.dns' }
+            Add-DnsServerPrimaryZone @p
+        }
+        foreach ($e in $eintraege) {
+            try { Add-NetDnsRecordExact -ZoneName $e.Zone -Name $e.Name -Typ $e.Typ -Daten $e.Daten }
+            catch { Write-Log -Level Debug -Message ('Eintrag {0} {1} in {2} uebersprungen: {3}' -f $e.Name, $e.Typ, $e.Zone, $_.Exception.Message) }
+        }
+    }
+    return [bool]($r.Erfolg -and -not $r.Probelauf)
+}
+# ----------------------------------------------------------------------
+# src/wartung/CsvImport.ps1
+# ----------------------------------------------------------------------
+# Massenimport aus CSV fuer DNS-Eintraege und DHCP-Reservierungen.
+# Jede Zeile wird vorher geprueft; bei einem Fehler wird nichts importiert (alles oder nichts).
+# Vorlagen liegen im Ordner Vorlagen (Trennzeichen Semikolon).
+#
+$script:NetVorlageDns = @(
+    'Zone;Name;Typ;Wert;Prioritaet;Gewicht;Port',
+    'ad.firma.ch;drucker-buero;A;192.168.1.30;;;',
+    'ad.firma.ch;intranet;CNAME;srv01.ad.firma.ch;;;',
+    'ad.firma.ch;@;MX;mail.firma.ch;10;;',
+    'ad.firma.ch;@;TXT;v=spf1 mx -all;;;',
+    'ad.firma.ch;_sip._tcp;SRV;sip.ad.firma.ch;0;100;5060'
+)
+$script:NetVorlageReservierung = @(
+    'ScopeId;IP;MAC;Name;Beschreibung',
+    '192.168.1.0;192.168.1.150;00-15-5D-01-02-03;drucker-buero;Drucker im Buero',
+    '192.168.1.0;192.168.1.151;00-15-5D-01-02-04;telefon-empfang;IP-Telefon'
+)
+#
+function New-NetImportTemplate {
+    <#
+    .SYNOPSIS
+        Legt die Beispiel-CSVs im Ordner Vorlagen an (vorhandene werden nicht ueberschrieben).
+    #>
+    $ordner = Get-NetPath -Name Vorlagen
+    if (-not (Test-Path -Path $ordner)) { New-Item -Path $ordner -ItemType Directory -Force | Out-Null }
+    foreach ($v in @(@{ Datei = 'dns-eintraege.csv'; Inhalt = $script:NetVorlageDns }, @{ Datei = 'reservierungen.csv'; Inhalt = $script:NetVorlageReservierung })) {
+        $pfad = Join-Path -Path $ordner -ChildPath $v.Datei
+        if (Test-Path -Path $pfad) { Write-Log -Message ('Vorlage existiert bereits: ' + $pfad); continue }
+        Set-Content -Path $pfad -Value $v.Inhalt -Encoding UTF8
+        Write-Log -Level OK -Message ('Vorlage angelegt: ' + $pfad)
+    }
+}
+#
+function ConvertTo-NetDnsImportRow {
+    <#
+    .SYNOPSIS
+        Prueft eine CSV-Zeile fuer DNS und liefert @{ Fehler; Eintrag } (Eintrag fuer Add-NetDnsRecordExact).
+    #>
+    param([Parameter(Mandatory = $true)][object]$Zeile, [string[]]$Zonen)
+    $typ = ([string]$Zeile.Typ).Trim().ToUpper()
+    $zone = ([string]$Zeile.Zone).Trim().ToLower().TrimEnd('.')
+    $name = ([string]$Zeile.Name).Trim()
+    $wert = ([string]$Zeile.Wert).Trim()
+    if ($script:NetDnsTypen -notcontains $typ) { return @{ Fehler = "Typ '$typ' ist unbekannt (erlaubt: $($script:NetDnsTypen -join ', '))." } }
+    if ($Zonen -notcontains $zone) { return @{ Fehler = "Zone '$zone' gibt es auf diesem DNS-Server nicht." } }
+    $grund = Test-NetDnsRecordName -Name $name -Srv:($typ -eq 'SRV')
+    if ($grund) { return @{ Fehler = $grund } }
+    if (-not $wert) { return @{ Fehler = 'Wert fehlt.' } }
+    $daten = @{}
+    $fqdnOk = ((Test-NetDomainName -Name $wert).Gueltig -or $wert -match '^[A-Za-z0-9-]+$')
+    switch ($typ) {
+        'A' { if (-not (Test-NetIPv4Address -Text $wert)) { return @{ Fehler = "'$wert' ist keine gueltige IPv4-Adresse." } }; $daten.IPv4Address = $wert }
+        'AAAA' { if (-not (Test-NetIPv6Address -Text $wert)) { return @{ Fehler = "'$wert' ist keine gueltige IPv6-Adresse." } }; $daten.IPv6Address = $wert }
+        'CNAME' { if (-not $fqdnOk) { return @{ Fehler = "'$wert' ist kein gueltiger Name." } }; $daten.HostNameAlias = $wert }
+        'PTR' { if (-not $fqdnOk) { return @{ Fehler = "'$wert' ist kein gueltiger Name." } }; $daten.PtrDomainName = $wert }
+        'TXT' { if ($wert.Length -gt 255) { return @{ Fehler = 'Text ist laenger als 255 Zeichen.' } }; $daten.DescriptiveText = $wert }
+        'MX' {
+            if (-not $fqdnOk) { return @{ Fehler = "'$wert' ist kein gueltiger Name." } }
+            $prio = 0
+            if (-not [int]::TryParse([string]$Zeile.Prioritaet, [ref]$prio) -or $prio -lt 0 -or $prio -gt 65535) { return @{ Fehler = 'Prioritaet muss eine Zahl von 0 bis 65535 sein.' } }
+            $daten.MailExchange = $wert; $daten.Preference = $prio
+        }
+        'SRV' {
+            if (-not $fqdnOk) { return @{ Fehler = "'$wert' ist kein gueltiger Name." } }
+            $prio = 0; $gew = 0; $port = 0
+            if (-not [int]::TryParse([string]$Zeile.Prioritaet, [ref]$prio) -or -not [int]::TryParse([string]$Zeile.Gewicht, [ref]$gew) -or -not [int]::TryParse([string]$Zeile.Port, [ref]$port) -or $port -lt 1 -or $port -gt 65535) {
+                return @{ Fehler = 'SRV braucht Prioritaet, Gewicht und Port (1-65535) als Zahlen.' }
+            }
+            $daten.DomainName = $wert; $daten.Priority = $prio; $daten.Weight = $gew; $daten.Port = $port
+        }
+    }
+    return @{ Fehler = $null; Eintrag = @{ ZoneName = $zone; Name = $name; Typ = $typ; Daten = $daten } }
+}
+#
+function Test-NetDnsImport {
+    <#
+    .SYNOPSIS
+        Prueft alle Zeilen einer DNS-CSV. Liefert Fehler (pro Zeile), Neu und Vorhanden.
+    #>
+    param([Parameter(Mandatory = $true)][object[]]$Zeilen)
+    $zonen = @(Get-NetDnsZoneInfo | Where-Object { $_.Typ -eq 'Primary' } | ForEach-Object { $_.Name })
+    $fehler = @()
+    $neu = @()
+    $vorhanden = @()
+    $gesehen = @{}
+    $nr = 1
+    foreach ($z in $Zeilen) {
+        $nr++
+        $r = ConvertTo-NetDnsImportRow -Zeile $z -Zonen $zonen
+        if ($r.Fehler) { $fehler += ('Zeile {0}: {1}' -f $nr, $r.Fehler); continue }
+        $e = $r.Eintrag
+        $schluessel = ('{0}|{1}|{2}|{3}' -f $e.ZoneName, $e.Name, $e.Typ, (($e.Daten.Keys | Sort-Object | ForEach-Object { $e.Daten[$_] }) -join ',')).ToLower()
+        if ($gesehen.ContainsKey($schluessel)) { $fehler += ('Zeile {0}: doppelt in der Datei (wie Zeile {1}).' -f $nr, $gesehen[$schluessel]); continue }
+        $gesehen[$schluessel] = $nr
+        $pruef = Test-NetDnsRecordConflict -Zone $e.ZoneName -Name $e.Name -Typ $e.Typ -Daten $e.Daten
+        if ($pruef.Duplikat) { $vorhanden += $e; continue }
+        if ($pruef.Konflikte.Count -gt 0) { $fehler += ('Zeile {0}: Konflikt - {1}' -f $nr, ($pruef.Konflikte -join ' ')); continue }
+        $neu += $e
+    }
+    return [pscustomobject]@{ Fehler = $fehler; Neu = $neu; Vorhanden = $vorhanden }
+}
+#
+function Test-NetReservationImport {
+    <#
+    .SYNOPSIS
+        Prueft alle Zeilen einer Reservierungs-CSV (Scope, Bereich, Ausschluss, belegt, MAC, Name).
+    #>
+    param([Parameter(Mandatory = $true)][object[]]$Zeilen)
+    $scopes = @(Get-NetDhcpScopeList)
+    $fehler = @()
+    $neu = @()
+    $vorhanden = @()
+    $ipGesehen = @{}
+    $macGesehen = @{}
+    $cache = @{}
+    $nr = 1
+    foreach ($z in $Zeilen) {
+        $nr++
+        $id = ([string]$z.ScopeId).Trim()
+        $ip = ([string]$z.IP).Trim()
+        $mac = ConvertTo-NetMacAddress -Text ([string]$z.MAC)
+        $name = ([string]$z.Name).Trim()
+        $scope = @($scopes | Where-Object { $_.ScopeId -eq $id }) | Select-Object -First 1
+        if (-not $scope) { $fehler += ("Zeile {0}: Scope '{1}' gibt es nicht." -f $nr, $id); continue }
+        if (-not (Test-NetIPv4Address -Text $ip)) { $fehler += ("Zeile {0}: '{1}' ist keine gueltige IPv4-Adresse." -f $nr, $ip); continue }
+        if (-not $mac) { $fehler += ("Zeile {0}: '{1}' ist keine gueltige MAC-Adresse." -f $nr, $z.MAC); continue }
+        $grund = Test-NetDnsRecordName -Name $name
+        if (-not $name -or $grund) { $fehler += ('Zeile {0}: Name ungueltig ({1}).' -f $nr, $grund); continue }
+        if ($ipGesehen.ContainsKey($ip)) { $fehler += ('Zeile {0}: IP {1} kommt schon in Zeile {2} vor.' -f $nr, $ip, $ipGesehen[$ip]); continue }
+        if ($macGesehen.ContainsKey($mac)) { $fehler += ('Zeile {0}: MAC {1} kommt schon in Zeile {2} vor.' -f $nr, $mac, $macGesehen[$mac]); continue }
+        $ipGesehen[$ip] = $nr
+        $macGesehen[$mac] = $nr
+        if (-not $cache.ContainsKey($id)) {
+            $cache[$id] = @{
+                Aus  = @(Get-NetSafe -Beschreibung 'Ausschluesse' -Standard @() -Abfrage { Get-DhcpServerv4ExclusionRange -ScopeId $id })
+                Res  = @(Get-NetSafe -Beschreibung 'Reservierungen' -Standard @() -Abfrage { Get-DhcpServerv4Reservation -ScopeId $id })
+                Leas = @(Get-NetSafe -Beschreibung 'Leases' -Standard @() -Abfrage { Get-DhcpServerv4Lease -ScopeId $id })
+            }
+        }
+        $c = $cache[$id]
+        $gleich = @($c.Res | Where-Object { $_ -and (ConvertTo-NetString $_.IPAddress) -eq $ip -and (ConvertTo-NetMacAddress -Text ([string]$_.ClientId)) -eq $mac })
+        if ($gleich.Count -gt 0) { $vorhanden += @{ ScopeId = $id; IP = $ip }; continue }
+        $probleme = @(Test-NetDhcpReservation -Scope $scope -IPAddress $ip -Mac $mac -Ausschluesse $c.Aus -Reservierungen $c.Res -Leases $c.Leas)
+        if ($probleme.Count -gt 0) { $fehler += ('Zeile {0}: {1}' -f $nr, ($probleme -join ' ')); continue }
+        $neu += @{ ScopeId = $id; IPAddress = $ip; ClientId = $mac; Name = $name; Description = ([string]$z.Beschreibung) }
+    }
+    return [pscustomobject]@{ Fehler = $fehler; Neu = $neu; Vorhanden = $vorhanden }
+}
+#
+function Import-NetCsv {
+    <#
+    .SYNOPSIS
+        Massenimport (DNS oder Reservierungen): pruefen, Ergebnis zeigen (wie im Probelauf),
+        nach Bestaetigung alles importieren. Bei einem Fehler waehrend des Imports wird das
+        bereits Angelegte wieder entfernt - nichts wird halb importiert.
+    #>
+    param([ValidateSet('Dns', 'Reservierung')][string]$Art, [string]$Datei)
+    if (-not $Art) {
+        $i = Read-NetChoice -Frage 'Was importieren?' -Optionen @('DNS-Eintraege', 'DHCP-Reservierungen') -Vorschlag 1
+        if ($i -lt 0) { return $false }
+        $Art = @('Dns', 'Reservierung')[$i]
+    }
+    if ($Art -eq 'Dns' -and -not (Test-NetDnsReady)) { return $false }
+    if ($Art -eq 'Reservierung' -and -not (Test-NetDhcpReady)) { return $false }
+    if (-not $Datei) {
+        $vorlage = Join-Path -Path (Get-NetPath -Name Vorlagen) -ChildPath $(if ($Art -eq 'Dns') { 'dns-eintraege.csv' } else { 'reservierungen.csv' })
+        Write-NetText -Text ('Format siehe Vorlage: ' + $vorlage + ' (Trennzeichen Semikolon, erste Zeile = Spaltennamen).')
+        $Datei = Read-NetText -Frage 'Pfad zur CSV-Datei' -Vorschlag $vorlage -Pruefung { param($t) if (Test-Path -Path $t -PathType Leaf) { $null } else { 'Die Datei existiert nicht.' } }
+        if (-not $Datei) { return $false }
+    }
+    $zeilen = @(Import-Csv -Path $Datei -Delimiter ';' -Encoding UTF8)
+    if ($zeilen.Count -eq 0) { Write-Log -Level Warn -Message 'Die Datei enthaelt keine Zeilen.'; return $false }
+    $pflicht = @('Zone', 'Name', 'Typ', 'Wert')
+    if ($Art -eq 'Reservierung') { $pflicht = @('ScopeId', 'IP', 'MAC', 'Name') }
+    $spalten = @($zeilen[0].PSObject.Properties | ForEach-Object { $_.Name })
+    $fehlt = @($pflicht | Where-Object { $spalten -notcontains $_ })
+    if ($fehlt.Count -gt 0) { Write-Log -Level Fehler -Message ('Spalten fehlen: ' + ($fehlt -join ', ') + '. Trennzeichen muss ein Semikolon sein.'); return $false }
+#
+    $ergebnis = $null
+    if ($Art -eq 'Dns') { $ergebnis = Test-NetDnsImport -Zeilen $zeilen } else { $ergebnis = Test-NetReservationImport -Zeilen $zeilen }
+    Write-NetTitle -Titel ('Pruefung der Datei: {0} Zeilen' -f $zeilen.Count)
+    Write-NetStatus -Status OK -Bereich 'neu anzulegen' -Text ([string]@($ergebnis.Neu).Count)
+    Write-NetStatus -Status NA -Bereich 'schon vorhanden' -Text ([string]@($ergebnis.Vorhanden).Count)
+    if (@($ergebnis.Fehler).Count -gt 0) {
+        Write-NetStatus -Status FEHLER -Bereich 'fehlerhafte Zeilen' -Text ([string]@($ergebnis.Fehler).Count)
+        foreach ($f in $ergebnis.Fehler) { Write-Host ('    ' + $f) -ForegroundColor Red }
+        Write-Log -Level Fehler -Message 'Es wird nichts importiert. Bitte die Zeilen korrigieren und erneut starten.'
+        return $false
+    }
+    $neu = @($ergebnis.Neu)
+    if ($neu.Count -eq 0) { Write-Log -Level OK -Message 'Alles aus der Datei ist schon vorhanden. Nichts zu tun.'; return $true }
+    $anzeige = @()
+    $rueck = @()
+    if ($Art -eq 'Dns') {
+        $anzeige = @($neu | ForEach-Object { '{0} {1} {2} in {3}' -f $_.Name, $_.Typ, (($_.Daten.Values | ForEach-Object { [string]$_ }) -join ' '), $_.ZoneName })
+        $rueck = @($neu | ForEach-Object { @{ Befehl = 'Remove-NetDnsRecordExact'; Parameter = @{ ZoneName = $_.ZoneName; Name = $_.Name; Typ = $_.Typ; Daten = $_.Daten } } })
+    }
+    else {
+        $anzeige = @($neu | ForEach-Object { '{0} {1} {2} (Scope {3})' -f $_.IPAddress, $_.ClientId, $_.Name, $_.ScopeId })
+        $rueck = @($neu | ForEach-Object { @{ Befehl = 'Remove-DhcpServerv4Reservation'; Parameter = @{ IPAddress = $_.IPAddress } } })
+    }
+    $importArt = $Art
+    $r = Invoke-NetChange -Titel ('{0} {1} aus CSV importieren' -f $neu.Count, $(if ($Art -eq 'Dns') { 'DNS-Eintraege' } else { 'Reservierungen' })) -Stufe Bestaetigen -Vorher ('{0} vorhanden' -f @($ergebnis.Vorhanden).Count) -Nachher $anzeige -BackupBereich @($(if ($Art -eq 'Dns') { 'Dns' } else { 'Dhcp' })) -Aktion {
+        $angelegt = New-Object System.Collections.ArrayList
+        try {
+            foreach ($e in $neu) {
+                if ($importArt -eq 'Dns') { Add-NetDnsRecordExact -ZoneName $e.ZoneName -Name $e.Name -Typ $e.Typ -Daten $e.Daten }
+                else { Add-DhcpServerv4Reservation -ScopeId $e.ScopeId -IPAddress $e.IPAddress -ClientId $e.ClientId -Name $e.Name -Description $e.Description }
+                [void]$angelegt.Add($e)
+            }
+        }
+        catch {
+            $fehlerText = $_.Exception.Message
+            Write-Log -Level Warn -Message ('Fehler beim Import ({0}). {1} bereits angelegte Eintraege werden wieder entfernt.' -f $fehlerText, $angelegt.Count)
+            for ($i = $angelegt.Count - 1; $i -ge 0; $i--) {
+                $x = $angelegt[$i]
+                try {
+                    if ($importArt -eq 'Dns') { Remove-NetDnsRecordExact -ZoneName $x.ZoneName -Name $x.Name -Typ $x.Typ -Daten $x.Daten }
+                    else { Remove-DhcpServerv4Reservation -IPAddress $x.IPAddress }
+                }
+                catch { Write-Log -Level Fehler -Message ('Konnte {0} nicht zuruecknehmen: {1}' -f $x.Name, $_.Exception.Message) }
+            }
+            throw
+        }
+    } -Rueckgaengig $rueck
+    return [bool]($r.Erfolg -and -not $r.Probelauf)
+}
+# ----------------------------------------------------------------------
+# src/wartung/Berichte.ps1
+# ----------------------------------------------------------------------
+# Berichte als HTML (alles inline: keine externen Links, Schriften oder Scripts) und CSV:
+# Scope-Auslastung, freie IPs, Leases ohne DNS, Doktor-Ergebnis, Aenderungsverlauf.
+#
+$script:NetBerichtCss = @'
+body { font-family: Segoe UI, Arial, sans-serif; margin: 24px; color: #222; background: #fff; }
+h1 { font-size: 22px; margin-bottom: 4px; }
+h2 { font-size: 17px; margin-top: 28px; border-bottom: 2px solid #2b579a; padding-bottom: 4px; }
+p.meta { color: #666; margin-top: 0; }
+table { border-collapse: collapse; margin-top: 8px; width: 100%; }
+th, td { border: 1px solid #ccc; padding: 4px 8px; text-align: left; font-size: 13px; vertical-align: top; }
+th { background: #eef2f8; }
+tr:nth-child(even) td { background: #fafafa; }
+.OK { color: #11722b; font-weight: bold; }
+.WARN { color: #a35c00; font-weight: bold; }
+.FEHLER { color: #b00020; font-weight: bold; }
+.NA { color: #888; }
+'@
+#
+function ConvertTo-NetHtmlText {
+    param([AllowNull()][object]$Wert)
+    if ($null -eq $Wert) { return '' }
+    return [System.Net.WebUtility]::HtmlEncode([string]$Wert)
+}
+#
+function ConvertTo-NetHtmlTable {
+    <#
+    .SYNOPSIS
+        Baut eine HTML-Tabelle aus Objekten. Spalte "Status" bekommt die Farbklasse.
+    #>
+    param([object[]]$Zeilen, [Parameter(Mandatory = $true)][string[]]$Spalten)
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.Append('<table><tr>')
+    foreach ($s in $Spalten) { [void]$sb.Append('<th>' + (ConvertTo-NetHtmlText $s) + '</th>') }
+    [void]$sb.Append('</tr>')
+    if (@($Zeilen).Count -eq 0) { [void]$sb.Append(('<tr><td colspan="{0}">keine Eintraege</td></tr>' -f $Spalten.Count)) }
+    foreach ($z in @($Zeilen)) {
+        [void]$sb.Append('<tr>')
+        foreach ($s in $Spalten) {
+            $w = $z.$s
+            if (($w -is [System.Collections.IEnumerable]) -and ($w -isnot [string])) { $w = (@($w) | ForEach-Object { [string]$_ }) -join ', ' }
+            $klasse = ''
+            if ($s -eq 'Status') { $klasse = ' class="' + (ConvertTo-NetHtmlText $w) + '"' }
+            [void]$sb.Append('<td' + $klasse + '>' + (ConvertTo-NetHtmlText $w) + '</td>')
+        }
+        [void]$sb.Append('</tr>')
+    }
+    [void]$sb.Append('</table>')
+    return $sb.ToString()
+}
+#
+function Get-NetFreeAddressRange {
+    <#
+    .SYNOPSIS
+        Ermittelt die freien Adressen eines Scopes (Bereich minus Ausschluesse, Reservierungen, Leases)
+        und fasst sie zu Bereichen zusammen.
+    #>
+    param([Parameter(Mandatory = $true)][string]$ScopeId, [Parameter(Mandatory = $true)][string]$Start, [Parameter(Mandatory = $true)][string]$Ende)
+    $belegt = New-Object 'System.Collections.Generic.HashSet[uint32]'
+    foreach ($a in @(Get-NetSafe -Beschreibung 'Ausschluesse' -Standard @() -Abfrage { Get-DhcpServerv4ExclusionRange -ScopeId $ScopeId })) {
+        if (-not $a) { continue }
+        $von = ConvertTo-NetIPv4UInt32 -IPAddress (ConvertTo-NetString $a.StartRange)
+        $bis = ConvertTo-NetIPv4UInt32 -IPAddress (ConvertTo-NetString $a.EndRange)
+        for ($x = $von; $x -le $bis; $x++) { [void]$belegt.Add([uint32]$x) }
+    }
+    foreach ($r in @(Get-NetSafe -Beschreibung 'Reservierungen' -Standard @() -Abfrage { Get-DhcpServerv4Reservation -ScopeId $ScopeId })) { if ($r) { [void]$belegt.Add((ConvertTo-NetIPv4UInt32 -IPAddress (ConvertTo-NetString $r.IPAddress))) } }
+    foreach ($l in @(Get-NetSafe -Beschreibung 'Leases' -Standard @() -Abfrage { Get-DhcpServerv4Lease -ScopeId $ScopeId })) { if ($l) { [void]$belegt.Add((ConvertTo-NetIPv4UInt32 -IPAddress (ConvertTo-NetString $l.IPAddress))) } }
+    $bereiche = @()
+    $anfang = $null
+    $s = ConvertTo-NetIPv4UInt32 -IPAddress $Start
+    $e = ConvertTo-NetIPv4UInt32 -IPAddress $Ende
+    $frei = 0
+    for ($x = [int64]$s; $x -le [int64]$e; $x++) {
+        if (-not $belegt.Contains([uint32]$x)) {
+            $frei++
+            if ($null -eq $anfang) { $anfang = $x }
+        }
+        elseif ($null -ne $anfang) {
+            $bereiche += ('{0} - {1}' -f (ConvertFrom-NetIPv4UInt32 -Wert ([uint32]$anfang)), (ConvertFrom-NetIPv4UInt32 -Wert ([uint32]($x - 1))))
+            $anfang = $null
+        }
+    }
+    if ($null -ne $anfang) { $bereiche += ('{0} - {1}' -f (ConvertFrom-NetIPv4UInt32 -Wert ([uint32]$anfang)), (ConvertFrom-NetIPv4UInt32 -Wert ([uint32]$e))) }
+    return [pscustomobject]@{ ScopeId = $ScopeId; Frei = $frei; Bereiche = $bereiche }
+}
+#
+function Get-NetReportData {
+    <#
+    .SYNOPSIS
+        Sammelt die Daten aller Berichtsteile.
+    #>
+    param([object[]]$DoktorErgebnis)
+    $z = Get-NetSetupState
+    $auslastung = @($z.Dhcp.Scopes | ForEach-Object {
+            $st = 'OK'
+            if ($_.Auslastung -ge 90) { $st = 'FEHLER' } elseif ($_.Auslastung -ge 80) { $st = 'WARN' }
+            [pscustomobject]@{ Scope = $_.ScopeId; Name = $_.Name; Bereich = ($_.Start + ' - ' + $_.Ende); Aktiv = $_.Aktiv; Belegt = $_.Belegt; Frei = $_.Frei; Prozent = ('{0:N0}' -f $_.Auslastung); Status = $st }
+        })
+    $frei = @($z.Dhcp.Scopes | ForEach-Object {
+            $f = Get-NetFreeAddressRange -ScopeId $_.ScopeId -Start $_.Start -Ende $_.Ende
+            [pscustomobject]@{ Scope = $f.ScopeId; Frei = $f.Frei; Bereiche = ($f.Bereiche -join '; ') }
+        })
+    $ohneDns = @()
+    if ($z.Dhcp.Verfuegbar -and $z.Dns.Verfuegbar) {
+        $ohneDns = @(Get-NetLeaseDnsCheck -Zustand $z | Where-Object { -not ($_.A -and $_.PTR) } | ForEach-Object { [pscustomobject]@{ IP = $_.IP; Name = $_.Name; A = $(if ($_.A) { 'ja' } else { 'fehlt' }); PTR = $(if ($_.PTR) { 'ja' } else { 'fehlt' }); Ursache = $_.Ursache } })
+    }
+    if (-not $DoktorErgebnis) { $DoktorErgebnis = @(Invoke-NetDoctor -NurPruefen -Still) }
+    $doktor = @($DoktorErgebnis | ForEach-Object { [pscustomobject]@{ Id = $_.Id; Kategorie = $_.Kategorie; Titel = $_.Titel; Status = $_.Status; Detail = $(if ($_.Status -eq 'OK' -or $_.Status -eq 'NA') { $_.Detail } else { ($_.Problem + ' ' + $_.Detail).Trim() }) } })
+    $verlauf = @(Get-NetUndoEntry | Select-Object -First 200 | ForEach-Object { [pscustomobject]@{ Zeit = $_.Zeit; Aenderung = $_.Titel; Benutzer = $_.Benutzer; Status = $(if ($_.Status -eq 'Offen') { 'aktiv' } else { $_.Status }) } })
+    return [pscustomobject]@{ Zustand = $z; Auslastung = $auslastung; Frei = $frei; OhneDns = $ohneDns; Doktor = $doktor; Verlauf = $verlauf }
+}
+#
+function New-NetReport {
+    <#
+    .SYNOPSIS
+        Erstellt einen HTML-Bericht (alles inline) und je Teil eine CSV-Datei im Ordner Berichte.
+    #>
+    param([object[]]$DoktorErgebnis, [string]$Name = 'Bericht')
+    $daten = Get-NetReportData -DoktorErgebnis $DoktorErgebnis
+    $zeit = Get-Date
+    $basis = Join-Path -Path (Get-NetPath -Name Berichte) -ChildPath ('{0}_{1}' -f $Name, $zeit.ToString('yyyyMMdd_HHmmss'))
+    $teile = [ordered]@{
+        'Scope-Auslastung'       = @{ Daten = $daten.Auslastung; Spalten = @('Scope', 'Name', 'Bereich', 'Aktiv', 'Belegt', 'Frei', 'Prozent', 'Status') }
+        'Freie IP-Adressen'      = @{ Daten = $daten.Frei; Spalten = @('Scope', 'Frei', 'Bereiche') }
+        'Leases ohne DNS-Eintrag' = @{ Daten = $daten.OhneDns; Spalten = @('IP', 'Name', 'A', 'PTR', 'Ursache') }
+        'Doktor-Ergebnis'        = @{ Daten = $daten.Doktor; Spalten = @('Id', 'Kategorie', 'Titel', 'Status', 'Detail') }
+        'Aenderungsverlauf'      = @{ Daten = $daten.Verlauf; Spalten = @('Zeit', 'Aenderung', 'Benutzer', 'Status') }
+    }
+    $s = $daten.Zustand.System
+    $html = New-Object System.Text.StringBuilder
+    [void]$html.Append('<!DOCTYPE html><html lang="de"><head><meta charset="utf-8"><title>NetSetup-Bericht ' + (ConvertTo-NetHtmlText $s.Hostname) + '</title><style>' + $script:NetBerichtCss + '</style></head><body>')
+    [void]$html.Append('<h1>NetSetup-Bericht ' + (ConvertTo-NetHtmlText $s.Hostname) + '</h1>')
+    [void]$html.Append('<p class="meta">' + (ConvertTo-NetHtmlText ('{0} - {1} - {2} - NetSetup {3}' -f $zeit.ToString('yyyy-MM-dd HH:mm'), $s.RolleText, $s.OsName, $script:NS.Version)) + '</p>')
+    $summe = Get-NetCheckSummary -Ergebnisse $daten.Doktor
+    [void]$html.Append('<p>Doktor: <span class="OK">' + $summe.OK + ' OK</span>, <span class="WARN">' + $summe.WARN + ' Warnungen</span>, <span class="FEHLER">' + $summe.FEHLER + ' Fehler</span></p>')
+    $nr = 0
+    foreach ($titel in $teile.Keys) {
+        $nr++
+        $t = $teile[$titel]
+        [void]$html.Append('<h2>' + (ConvertTo-NetHtmlText $titel) + '</h2>')
+        [void]$html.Append((ConvertTo-NetHtmlTable -Zeilen $t.Daten -Spalten $t.Spalten))
+        $csv = '{0}_{1}_{2}.csv' -f $basis, $nr, ($titel -replace '[^A-Za-z0-9]+', '')
+        @($t.Daten) | Select-Object -Property $t.Spalten | Export-Csv -Path $csv -NoTypeInformation -Encoding UTF8 -Delimiter ';'
+    }
+    [void]$html.Append('</body></html>')
+    $datei = $basis + '.html'
+    [System.IO.File]::WriteAllText($datei, $html.ToString(), (New-Object System.Text.UTF8Encoding($true)))
+    Write-Log -Level OK -Message ('Bericht erstellt: ' + $datei)
+    return $datei
+}
+#
+function New-NetHealthReport {
+    <#
+    .SYNOPSIS
+        Bericht fuer die geplante Gesundheitspruefung (-Task Health).
+    #>
+    param([object[]]$Ergebnisse)
+    return (New-NetReport -DoktorErgebnis $Ergebnisse -Name 'Gesundheit')
+}
+#
+function Invoke-NetReportTask {
+    New-NetReport | Out-Null
+}
+#
+function Show-NetReport {
+    $datei = New-NetReport
+    if ($datei -and $script:NS.Umgebung -and -not $script:NS.Umgebung.IstCore -and (Read-NetYesNo -Frage 'Bericht jetzt im Browser oeffnen?' -Vorschlag $true)) {
+        Invoke-Item -Path $datei
+    }
+}
+#
+function Show-NetFreeAddress {
+    if (-not (Test-NetDhcpReady)) { return }
+    Write-NetTitle -Titel 'Freie IP-Adressen'
+    foreach ($s in @(Get-NetDhcpScopeList)) {
+        $f = Get-NetFreeAddressRange -ScopeId $s.ScopeId -Start $s.Start -Ende $s.Ende
+        Write-Host ('  {0} ({1}): {2} frei' -f $s.ScopeId, $s.Name, $f.Frei) -ForegroundColor White
+        foreach ($b in ($f.Bereiche | Select-Object -First 20)) { Write-Host ('    ' + $b) }
+    }
+}
+#
+function Show-NetReportMenu {
+    $eintraege = @(
+        @{ Text = 'Gesamtbericht erstellen (HTML + CSV)'; Aktion = 'Show-NetReport'; Hilfe = "Scope-Auslastung, freie IPs, Leases ohne DNS, Doktor-Ergebnis und Aenderungsverlauf in einer HTML-Datei (ohne Internet lesbar) und je Teil als CSV im Ordner Berichte." },
+        @{ Text = 'Freie IP-Adressen anzeigen'; Aktion = 'Show-NetFreeAddress'; Hilfe = 'Bereich minus Ausschluesse, Reservierungen und Leases, zusammengefasst zu Bereichen.' },
+        @{ Text = 'Leases ohne DNS-Eintrag'; Aktion = { if (Test-NetCommand -Name 'Show-NetLeaseDnsCheck') { Show-NetLeaseDnsCheck | Out-Null } }; Hilfe = 'Prueft alle aktiven Leases auf A- und PTR-Eintrag (mit Ursache).' },
+        @{ Text = 'Aenderungsverlauf'; Aktion = 'Show-NetChangeHistory'; Hilfe = 'Alle Aenderungen, die NetSetup gemacht hat, mit Zeit und Status (aktiv/rueckgaengig).' },
+        @{ Text = 'Ordner Berichte anzeigen'; Aktion = { Write-Log -Message ('Berichte: ' + (Get-NetPath -Name Berichte)); Get-ChildItem -Path (Get-NetPath -Name Berichte) | Sort-Object -Property LastWriteTime -Descending | Select-Object -First 15 | ForEach-Object { Write-Host ('  ' + $_.Name) } }; Hilfe = 'Listet die neuesten Berichte.' }
+    )
+    Show-NetMenu -Titel 'Berichte' -Eintraege $eintraege
+}
+# ----------------------------------------------------------------------
+# src/wartung/WartungMenue.ps1
+# ----------------------------------------------------------------------
+# Geplante Aufgabe (taeglich -Task Health) und Menue "Backup, Wiederherstellen, Rueckgaengig".
+#
+$script:NetAufgabeName = 'NetSetup Gesundheitspruefung'
+#
+function Get-NetHealthTask {
+    return (Get-NetSafe -Beschreibung 'Geplante Aufgabe' -Abfrage { Get-ScheduledTask -TaskName $script:NetAufgabeName })
+}
+#
+function Register-NetHealthTask {
+    <#
+    .SYNOPSIS
+        Legt die taegliche Gesundheitspruefung als geplante Aufgabe an (laeuft als SYSTEM, aendert nichts).
+    #>
+    $vorhanden = Get-NetHealthTask
+    if ($vorhanden) { Write-Log -Level OK -Message ('Die geplante Aufgabe "{0}" gibt es bereits.' -f $script:NetAufgabeName); return $true }
+    $uhrzeit = Read-NetText -Frage 'Uhrzeit (HH:MM)' -Vorschlag '06:30' -Pruefung { param($t) if ($t -match '^([01]\d|2[0-3]):[0-5]\d$') { $null } else { 'Bitte im Format HH:MM eingeben, z. B. 06:30.' } }
+    if (-not $uhrzeit) { return $false }
+    $scriptDatei = Save-NetSelf
+    if (-not $scriptDatei) { $scriptDatei = Get-NetPath -Name Script }
+    $argumente = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}" -Task Health' -f $scriptDatei
+    $exe = Get-NetPowerShellExe
+    $name = $script:NetAufgabeName
+    $r = Invoke-NetChange -Titel "Geplante Aufgabe '$name' anlegen" -Stufe Bestaetigen -Vorher '(keine)' -Nachher @{ Aufgabe = $name; Zeit = "taeglich $uhrzeit"; Konto = 'SYSTEM'; Befehl = "$exe $argumente"; Ergebnis = (Get-NetPath -Name Berichte) } `
+        -Hinweis 'Die Aufgabe prueft nur und schreibt einen Bericht. Sie aendert nichts am Server.' -Aktion {
+        $aktion = New-ScheduledTaskAction -Execute $exe -Argument $argumente -WorkingDirectory (Get-NetPath -Name Root)
+        $ausloeser = New-ScheduledTaskTrigger -Daily -At $uhrzeit
+        $konto = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+        $einst = New-ScheduledTaskSettingsSet -StartWhenAvailable -ExecutionTimeLimit ([TimeSpan]::FromHours(1))
+        Register-ScheduledTask -TaskName $name -Action $aktion -Trigger $ausloeser -Principal $konto -Settings $einst -Description 'Taegliche Pruefung von AD, DNS und DHCP durch NetSetup (aendert nichts).' | Out-Null
+    } -Rueckgaengig @{ Befehl = 'Unregister-ScheduledTask'; Parameter = @{ TaskName = $name; Confirm = $false } }
+    return [bool]($r.Erfolg -and -not $r.Probelauf)
+}
+#
+function Unregister-NetHealthTask {
+    if (-not (Get-NetHealthTask)) { Write-Log -Message 'Es gibt keine geplante Aufgabe von NetSetup.'; return }
+    $name = $script:NetAufgabeName
+    Invoke-NetChange -Titel "Geplante Aufgabe '$name' entfernen" -Stufe Bestaetigen -Vorher 'vorhanden' -Nachher '(entfernt)' -Aktion {
+        Unregister-ScheduledTask -TaskName $name -Confirm:$false
+    } | Out-Null
+}
+#
+function Show-NetHealthTask {
+    $t = Get-NetHealthTask
+    if (-not $t) { Write-NetStatus -Status NA -Bereich 'Geplante Aufgabe' -Text 'nicht eingerichtet (optional)'; return }
+    Write-NetStatus -Status OK -Bereich 'Geplante Aufgabe' -Text ('{0}, Zustand {1}' -f $t.TaskName, $t.State)
+}
+#
+function Show-NetUndoMenu {
+    $eintraege = @(
+        @{ Text = 'Letzte Aenderung rueckgaengig machen'; Aktion = 'Undo-NetLastChange'; Hilfe = 'Fuehrt die gemerkte Gegenaktion der letzten Aenderung aus (mit Vorher/Nachher und Bestaetigung).' },
+        @{ Text = 'Aenderung aus dem Verlauf waehlen'; Aktion = 'Undo-NetSelectedChange'; Hilfe = 'Waehlt eine bestimmte Aenderung aus dem Verlauf und nimmt sie zurueck.' },
+        @{ Text = 'Verlauf anzeigen'; Aktion = 'Show-NetChangeHistory'; Hilfe = 'Alle Aenderungen mit Zeit und Status.' }
+    )
+    Show-NetMenu -Titel 'Rueckgaengig' -Eintraege $eintraege
+}
+#
+function Show-NetMaintenanceMenu {
+    $eintraege = @(
+        @{ Text = 'Backup jetzt erstellen'; Aktion = 'Invoke-NetBackupNow'; Hilfe = "Sichert DHCP (Datenbank + Export mit Leases), DNS (jede Zone + alle Eintraege als CSV), Konfiguration und Netzwerk.`nVor jeder Aenderung sichert NetSetup automatisch; die letzten 20 Backups werden aufbewahrt (Einstellungen)." },
+        @{ Text = 'Backups anzeigen'; Aktion = 'Show-NetBackupList'; Hilfe = 'Liste aller Backups mit Zeit, Anlass und Inhalt.' },
+        @{ Text = 'DHCP wiederherstellen (gefaehrlich)'; Aktion = { Restore-NetDhcpBackup | Out-Null }; Hilfe = 'Datenbank zuruecksetzen (Restore-DhcpServer) oder Konfiguration importieren (Import-DhcpServer). Vorher wird der aktuelle Stand gesichert, Servername eintippen.' },
+        @{ Text = 'DNS-Eintraege wiederherstellen (gefaehrlich)'; Aktion = { Restore-NetDnsBackup | Out-Null }; Hilfe = 'Legt fehlende Eintraege (und Zonen) aus der CSV eines Backups neu an. Vorhandene Eintraege bleiben unveraendert.' },
+        @{ Text = 'Rueckgaengig'; Aktion = 'Show-NetUndoMenu'; OhnePause = $true; Hilfe = 'Letzte Aenderung oder eine Aenderung aus dem Verlauf zuruecknehmen.' },
+        @{ Text = 'Serverumzug: Paket exportieren'; Aktion = { Export-NetMigrationPackage | Out-Null }; Hilfe = 'Packt DHCP (mit Leases), DNS-Zonen und -Eintraege und die Konfiguration in einen Ordner (optional ZIP) fuer den neuen Server.' },
+        @{ Text = 'Serverumzug: Paket importieren'; Aktion = { Import-NetMigrationPackage | Out-Null }; Hilfe = 'Importiert ein Paket auf diesem Server: Bestandsaufnahme, Vorher/Nachher, vorhandene Scopes und Zonen werden nicht ueberschrieben.' },
+        @{ Text = 'CSV-Import (DNS-Eintraege oder Reservierungen)'; Aktion = { Import-NetCsv | Out-Null }; Hilfe = "Prueft jede Zeile vorher und zeigt das Ergebnis. Bei einem Fehler wird nichts importiert (alles oder nichts).`nVorlagen: Menuepunkt 'Vorlagen anlegen'." },
+        @{ Text = 'Vorlagen anlegen'; Aktion = 'New-NetImportTemplate'; Hilfe = 'Legt Beispiel-CSVs fuer DNS-Eintraege und Reservierungen im Ordner Vorlagen an.' },
+        @{ Text = 'Geplante Aufgabe: taegliche Pruefung einrichten'; Aktion = { Register-NetHealthTask | Out-Null }; Hilfe = 'Optional: taeglich NetSetup -Task Health als SYSTEM. Prueft nur und schreibt einen Bericht nach Berichte.' },
+        @{ Text = 'Geplante Aufgabe entfernen'; Aktion = 'Unregister-NetHealthTask'; Hilfe = 'Entfernt die geplante Gesundheitspruefung wieder.' }
+    )
+    Show-NetMenu -Titel 'Backup, Wiederherstellen, Rueckgaengig' -Eintraege $eintraege -Kopf { Show-NetHealthTask; Write-Host ('  Backups: {0}' -f @(Get-NetBackupList).Count) }
 }
 # ----------------------------------------------------------------------
 # src/ui/Ersteinrichtung.ps1

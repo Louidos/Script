@@ -244,7 +244,9 @@ function Test-NetUndoCommand {
     $cmd = Get-Command -Name $Befehl -ErrorAction SilentlyContinue
     if (-not $cmd) { return $false }
     if ($cmd.CommandType -eq 'Function' -and $Befehl -match '^[A-Za-z]+-Net') { return $true }
-    return ($script:NetUndoModule -contains [string]$cmd.ModuleName)
+    if ($script:NetUndoModule -contains [string]$cmd.ModuleName) { return $true }
+    # Befehle der Server-Module auch am Namen erkennen (z. B. wenn das Modul anders geladen wurde).
+    return ($Befehl -match '^[A-Za-z]+-(DnsServer|DhcpServer|NetIPAddress|NetIPInterface|NetRoute|DnsClient|NetFirewall|AD[A-Z]|WindowsFeature|ScheduledTask|Item$|ItemProperty$|Computer$)')
 }
 
 function Undo-NetChange {

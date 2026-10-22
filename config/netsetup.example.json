@@ -1,0 +1,42 @@
+{
+  "SchemaVersion": 1,
+  "Allgemein": {
+    "Probelauf": false,
+    "AutoReparatur": true,
+    "BackupAufbewahrung": 20,
+    "GridView": true,
+    "VerknuepfungGefragt": false
+  },
+  "Vorschlaege": {
+    "Weiterleitungen": ["9.9.9.9", "1.1.1.1"],
+    "ScavengingAktiv": true,
+    "NoRefreshTage": 7,
+    "RefreshTage": 7,
+    "LeaseTage": 8,
+    "DnsDienstkonto": "svc-dhcpdns",
+    "AuslastungWarnung": 80,
+    "AuslastungFehler": 90
+  },
+  "AD": {
+    "Domaene": "ad.firma.ch",
+    "NetBios": "FIRMA",
+    "Modus": ""
+  },
+  "Dns": {
+    "Zonen": [],
+    "Weiterleitungen": [],
+    "Scavenging": {}
+  },
+  "Dhcp": {
+    "Scopes": [],
+    "ServerOptionen": {},
+    "DnsEinstellung": {}
+  },
+  "Erweitert": {
+    "Dnssec": false,
+    "SplitBrain": false,
+    "Richtlinien": false,
+    "Sperrliste": false,
+    "Dhcpv6": false
+  }
+}

@@ -28,7 +28,13 @@ function Read-NetText {
         [scriptblock]$Pruefung,
         [switch]$LeerErlaubt
     )
+    $versuche = 0
     while ($true) {
+        $versuche++
+        if ($versuche -gt 25) {
+            Write-Log -Level Warn -Message 'Zu viele ungueltige Eingaben, Abbruch.'
+            return $null
+        }
         $prompt = $Frage
         if ($Vorschlag) { $prompt += " [$Vorschlag]" }
         $antwort = Read-NetInput -Prompt $prompt
