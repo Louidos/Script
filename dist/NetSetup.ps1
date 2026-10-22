@@ -1,5 +1,5 @@
 <#
-    NetSetup 0.0.0 (Build 2026-10-22 21:59)
+    NetSetup 0.0.0 (Build 2026-10-22 22:05)
     AD, DNS und DHCP auf Windows Server einrichten, verwalten und reparieren.
 #
     So starten (PowerShell oder PowerShell ISE als Administrator):
@@ -14,7 +14,7 @@
 #>
 $NetSetupCode = {
 $script:NetSetupVersion = '0.0.0'
-$script:NetSetupBuildDatum = '2026-10-22 21:59'
+$script:NetSetupBuildDatum = '2026-10-22 22:05'
 # ----------------------------------------------------------------------
 # src/core/Zustand.ps1
 # ----------------------------------------------------------------------
@@ -623,7 +623,10 @@ function Invoke-NetStep {
         [Parameter(Mandatory = $true)][scriptblock]$Aktion,
         [switch]$Still
     )
+    # CDXML-Cmdlets (DnsServer, DhcpServer, NetTCPIP) beachten $ErrorActionPreference des Aufrufers
+    # nicht. Mit -ErrorAction Stop als Standard wird jeder Fehler zuverlaessig abgefangen.
     $ErrorActionPreference = 'Stop'
+    $PSDefaultParameterValues = @{ '*:ErrorAction' = 'Stop' }
     try {
         $nsErgebnis = & $Aktion
         if (-not $Still) { Write-Log -Level OK -Message $Titel }
@@ -648,6 +651,7 @@ function Get-NetSafe {
         [string]$Beschreibung = 'Abfrage'
     )
     $ErrorActionPreference = 'Stop'
+    $PSDefaultParameterValues = @{ '*:ErrorAction' = 'Stop' }
     try {
         return (& $Abfrage)
     }

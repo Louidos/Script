@@ -222,3 +222,12 @@ Describe 'Format-NetValue' {
         Format-NetValue -Wert $null | Should -Be '(nichts)'
     }
 }
+
+Describe 'Fehler von Cmdlets ohne Beachtung von $ErrorActionPreference' {
+    It 'Invoke-NetStep faengt nicht-terminierende Fehler ab (wie bei CDXML-Cmdlets)' {
+        function Test-NetNichtTerminierend { [CmdletBinding()] param() Write-Error -Message 'nicht gefunden' -ErrorAction $(if ($PSBoundParameters.ContainsKey('ErrorAction')) { $PSBoundParameters['ErrorAction'] } else { 'Continue' }) }
+        $r = Invoke-NetStep -Titel 'Test' -Aktion { Test-NetNichtTerminierend } -Still
+        $r.Erfolg | Should -BeFalse
+        Get-NetSafe -Abfrage { Test-NetNichtTerminierend } -Standard 'ersatz' | Should -Be 'ersatz'
+    }
+}

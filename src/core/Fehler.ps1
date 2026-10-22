@@ -151,7 +151,10 @@ function Invoke-NetStep {
         [Parameter(Mandatory = $true)][scriptblock]$Aktion,
         [switch]$Still
     )
+    # CDXML-Cmdlets (DnsServer, DhcpServer, NetTCPIP) beachten $ErrorActionPreference des Aufrufers
+    # nicht. Mit -ErrorAction Stop als Standard wird jeder Fehler zuverlaessig abgefangen.
     $ErrorActionPreference = 'Stop'
+    $PSDefaultParameterValues = @{ '*:ErrorAction' = 'Stop' }
     try {
         $nsErgebnis = & $Aktion
         if (-not $Still) { Write-Log -Level OK -Message $Titel }
@@ -176,6 +179,7 @@ function Get-NetSafe {
         [string]$Beschreibung = 'Abfrage'
     )
     $ErrorActionPreference = 'Stop'
+    $PSDefaultParameterValues = @{ '*:ErrorAction' = 'Stop' }
     try {
         return (& $Abfrage)
     }
