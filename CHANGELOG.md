@@ -16,6 +16,7 @@ Format nach [Keep a Changelog](https://keepachangelog.com/de/1.1.0/), Versionen 
 - Doktor: erkennt falsch installierte Rollen, Netzwerk-, AD-, DNS- und DHCP-Fehler (39 Prüfungen, u. a. Rechte, Zeit, Dienste, Freigaben, SRV-Einträge, Firewall nach Port, fremde DHCP-Server, Auslastung, Optionen, Zugangsdaten) und repariert sie je nach Stufe; Harmloses automatisch (abschaltbar), alles andere einzeln, danach erneute Prüfung (#8)
 - Backup (DHCP, DNS, Konfiguration, Netzwerk) automatisch vor jeder Änderung mit Aufbewahrung der letzten 20, Wiederherstellen, Rückgängig aus dem Verlauf, Serverumzug per Paket, CSV-Massenimport mit Vorprüfung (alles oder nichts), HTML- und CSV-Berichte ohne Internet und optionale tägliche Prüfung als geplante Aufgabe (#9)
 - Menü „Erweitert“ mit DNSSEC, Split-Brain-DNS, DHCP-Richtlinien, DNS-Sperrliste und DHCPv6 – standardmässig aus, mit Hilfe, Warnung und Rücknahme (#10)
+- Handbuch mit allen Menüpunkten, typischen Abläufen und Glossar (gleiche Texte wie im Script), Testplan für echte Server und ausführliche Anleitung zum Einfügen im README (#11)
 
 ### Behoben
 - Fehler der Server-Cmdlets (DNS, DHCP, Netzwerk) werden immer abgefangen und verständlich gemeldet statt rot ausgegeben (#8)

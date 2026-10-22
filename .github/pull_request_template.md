@@ -12,7 +12,7 @@ Closes #
 - [ ] `./scripts/Build-NetSetup.ps1` ausgeführt, `dist/NetSetup.ps1` aktuell
 - [ ] Tests ergänzt, `Invoke-Pester -Path tests -CI` grün
 - [ ] `Invoke-ScriptAnalyzer` ohne Befunde
-- [ ] README/docs angepasst, falls sich Bedienung oder Verhalten ändert
+- [ ] README/docs angepasst, falls sich Bedienung oder Verhalten ändert (`./scripts/Update-Handbuch.ps1` bei neuen Menüpunkten oder Glossarbegriffen)
 
 ## Getestet
 
