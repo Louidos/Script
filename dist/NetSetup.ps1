@@ -1,5 +1,5 @@
 <#
-    NetSetup 0.0.0 (Build 2026-10-22 21:49)
+    NetSetup 0.0.0 (Build 2026-10-22 21:59)
     AD, DNS und DHCP auf Windows Server einrichten, verwalten und reparieren.
 #
     So starten (PowerShell oder PowerShell ISE als Administrator):
@@ -14,7 +14,7 @@
 #>
 $NetSetupCode = {
 $script:NetSetupVersion = '0.0.0'
-$script:NetSetupBuildDatum = '2026-10-22 21:49'
+$script:NetSetupBuildDatum = '2026-10-22 21:59'
 # ----------------------------------------------------------------------
 # src/core/Zustand.ps1
 # ----------------------------------------------------------------------
@@ -44,6 +44,7 @@ $script:NS = @{
     Zusammenfassung = $null
     AssistentAktiv  = $false
     NeustartGeplant = $false
+    LetzterDoktor   = $null
 }
 # ----------------------------------------------------------------------
 # src/core/Pfade.ps1
@@ -6444,6 +6445,1405 @@ function Show-NetIntegrationMenu {
         @{ Text = 'Pruefen: Leases ohne DNS-Eintrag'; Aktion = { Show-NetLeaseDnsCheck | Out-Null }; Hilfe = 'Gleicht alle aktiven Leases mit A- und PTR-Eintraegen ab, nennt die wahrscheinliche Ursache und bietet das Nachtragen an.' }
     )
     Show-NetMenu -Titel 'DHCP + DNS verbinden' -Eintraege $eintraege -Einleitung $script:NetIntegrationHilfe
+}
+# ----------------------------------------------------------------------
+# src/doktor/Engine.ps1
+# ----------------------------------------------------------------------
+# Doktor: Pruefungen ausfuehren, Ergebnis anzeigen, reparieren (je nach Stufe), erneut pruefen.
+# Jede Pruefung ist eine eigene Datei in src/checks/ und meldet sich mit Register-NetCheck an.
+#
+# Aufbau einer Pruefung (Hashtable):
+#   Id            eindeutige Kennung, z. B. 'N01'
+#   Kategorie     Rechte, Rollen, AD, Netzwerk, DHCP, DNS
+#   Titel         kurzer Name
+#   Voraussetzung { param($Z) ... }  $true = Pruefung ist sinnvoll (sonst [--])
+#   Test          { param($Z) ... }  liefert New-NetCheckResult
+#   Problem       was falsch ist (Klartext)
+#   Erklaerung    warum das wichtig ist und was die Reparatur tut
+#   Reparatur     { param($Z, $E) ... }  oder $null
+#   (param() kann entfallen, wenn Zustand bzw. Ergebnis nicht gebraucht werden)
+#   Stufe         Automatisch, Bestaetigen, Gefaehrlich
+#   Interaktiv    $true, wenn die Reparatur selbst fragt (nutzt intern Invoke-NetChange)
+#   Backup        Bereiche fuer das Backup vor der Reparatur (optional)
+#
+$script:NetCheckKategorien = @('Rechte', 'Rollen', 'AD', 'Netzwerk', 'DHCP', 'DNS')
+#
+function New-NetCheckResult {
+    param(
+        [Parameter(Mandatory = $true, Position = 0)][ValidateSet('OK', 'WARN', 'FEHLER', 'NA')][string]$Status,
+        [Parameter(Position = 1)][string]$Detail = '',
+        [Parameter(Position = 2)][object]$Daten = $null
+    )
+    return @{ Status = $Status; Detail = $Detail; Daten = $Daten }
+}
+#
+function Register-NetCheck {
+    <#
+    .SYNOPSIS
+        Meldet eine Pruefung beim Doktor an (eine Datei pro Pruefung in src/checks/).
+    #>
+    param([Parameter(Mandatory = $true, Position = 0)][hashtable]$Pruefung)
+    foreach ($pflicht in @('Id', 'Kategorie', 'Titel', 'Test', 'Problem', 'Erklaerung')) {
+        if (-not $Pruefung.ContainsKey($pflicht) -or -not $Pruefung[$pflicht]) { throw "Pruefung ohne Pflichtfeld '$pflicht'." }
+    }
+    if (-not $Pruefung.ContainsKey('Stufe')) { $Pruefung.Stufe = 'Bestaetigen' }
+    if (@('Automatisch', 'Bestaetigen', 'Gefaehrlich') -notcontains $Pruefung.Stufe) { throw ("Pruefung {0}: unbekannte Stufe {1}." -f $Pruefung.Id, $Pruefung.Stufe) }
+    if ($script:NetCheckKategorien -notcontains $Pruefung.Kategorie) { throw ("Pruefung {0}: unbekannte Kategorie {1}." -f $Pruefung.Id, $Pruefung.Kategorie) }
+    if (-not $Pruefung.ContainsKey('Interaktiv')) { $Pruefung.Interaktiv = $false }
+    if (-not $Pruefung.ContainsKey('Reparatur')) { $Pruefung.Reparatur = $null }
+    if (-not $Pruefung.ContainsKey('Voraussetzung')) { $Pruefung.Voraussetzung = $null }
+    if (-not $Pruefung.ContainsKey('Backup')) { $Pruefung.Backup = @() }
+    foreach ($alt in @($script:NS.Checks | Where-Object { $_.Id -eq $Pruefung.Id })) { [void]$script:NS.Checks.Remove($alt) }
+    [void]$script:NS.Checks.Add($Pruefung)
+}
+#
+function Get-NetCheck {
+    param([string[]]$Kategorie, [string[]]$Id)
+    $liste = @($script:NS.Checks)
+    if ($Kategorie) { $liste = @($liste | Where-Object { $Kategorie -contains $_.Kategorie }) }
+    if ($Id) { $liste = @($liste | Where-Object { $Id -contains $_.Id }) }
+    return @($liste | Sort-Object -Property @{ Expression = { [array]::IndexOf($script:NetCheckKategorien, $_.Kategorie) } }, @{ Expression = { $_.Id } })
+}
+#
+function Invoke-NetCheck {
+    <#
+    .SYNOPSIS
+        Fuehrt eine Pruefung aus. Fehler in der Pruefung selbst fuehren zu [WARN], nie zum Absturz.
+    #>
+    param([Parameter(Mandatory = $true)][hashtable]$Pruefung, [Parameter(Mandatory = $true)][hashtable]$Zustand)
+    $ergebnis = [pscustomobject]@{
+        Id = $Pruefung.Id; Kategorie = $Pruefung.Kategorie; Titel = $Pruefung.Titel; Status = 'NA'; Detail = ''
+        Problem = $Pruefung.Problem; Erklaerung = $Pruefung.Erklaerung; Stufe = $Pruefung.Stufe
+        KannReparieren = [bool]$Pruefung.Reparatur; Daten = $null
+    }
+    try {
+        if ($Pruefung.Voraussetzung -and -not (& $Pruefung.Voraussetzung $Zustand)) {
+            $ergebnis.Detail = 'trifft hier nicht zu'
+            return $ergebnis
+        }
+        $r = & $Pruefung.Test $Zustand
+        if ($r -is [bool]) { $r = @{ Status = $(if ($r) { 'OK' } else { 'FEHLER' }); Detail = '' } }
+        if ($r -isnot [hashtable] -or -not $r.Status) { throw 'Die Pruefung hat kein gueltiges Ergebnis geliefert.' }
+        $ergebnis.Status = $r.Status
+        $ergebnis.Detail = [string]$r.Detail
+        $ergebnis.Daten = $r.Daten
+    }
+    catch {
+        $ergebnis.Status = 'WARN'
+        $ergebnis.Detail = 'Pruefung nicht moeglich: ' + $_.Exception.Message
+        $ergebnis.KannReparieren = $false
+        Write-Log -Level Debug -Message ('Pruefung {0}: {1}' -f $Pruefung.Id, $_.Exception.ToString())
+    }
+    return $ergebnis
+}
+#
+function Show-NetCheckResult {
+    param([object[]]$Ergebnisse)
+    $kategorie = ''
+    foreach ($e in $Ergebnisse) {
+        if ($e.Kategorie -ne $kategorie) {
+            $kategorie = $e.Kategorie
+            Write-Host ''
+            Write-Host ('  ' + $kategorie) -ForegroundColor White
+        }
+        $text = $e.Detail
+        if ($e.Status -ne 'OK' -and $e.Status -ne 'NA' -and $e.Problem) { $text = $e.Problem + ' ' + $e.Detail }
+        Write-NetStatus -Status $e.Status -Bereich ('{0} {1}' -f $e.Id, $e.Titel) -Text $text.Trim()
+    }
+}
+#
+function Get-NetCheckSummary {
+    param([object[]]$Ergebnisse)
+    $ok = @($Ergebnisse | Where-Object { $_.Status -eq 'OK' }).Count
+    $warn = @($Ergebnisse | Where-Object { $_.Status -eq 'WARN' }).Count
+    $fehler = @($Ergebnisse | Where-Object { $_.Status -eq 'FEHLER' }).Count
+    $na = @($Ergebnisse | Where-Object { $_.Status -eq 'NA' }).Count
+    return [pscustomobject]@{ OK = $ok; WARN = $warn; FEHLER = $fehler; NA = $na; Text = ('{0} OK, {1} Warnung(en), {2} Fehler, {3} nicht zutreffend' -f $ok, $warn, $fehler, $na) }
+}
+#
+function Invoke-NetCheckRepair {
+    <#
+    .SYNOPSIS
+        Repariert ein Ergebnis gemaess Stufe und Probelauf. Liefert $true, wenn repariert wurde.
+    #>
+    param([Parameter(Mandatory = $true)][object]$Ergebnis, [Parameter(Mandatory = $true)][hashtable]$Zustand, [switch]$Automatisch)
+    $chkPruefung = @(Get-NetCheck -Id $Ergebnis.Id) | Select-Object -First 1
+    if (-not $chkPruefung -or -not $chkPruefung.Reparatur) { return $false }
+    $chkReparatur = $chkPruefung.Reparatur
+    $chkZustand = $Zustand
+    $chkErgebnis = $Ergebnis
+    if ($chkPruefung.Interaktiv) {
+        if ($Automatisch) { return $false }
+        Write-Host ''
+        Write-Host ('--- {0} {1} ---' -f $chkPruefung.Id, $chkPruefung.Titel) -ForegroundColor Yellow
+        Write-NetText -Text ($chkPruefung.Problem + ' ' + $Ergebnis.Detail) -Farbe Yellow
+        Write-NetText -Text $chkPruefung.Erklaerung
+        if (-not (Read-NetYesNo -Frage 'Reparatur starten?' -Vorschlag $true)) { return $false }
+        try { & $chkReparatur $chkZustand $chkErgebnis | Out-Null; return $true }
+        catch { Write-NetError -Fehler $_ -Titel ('Reparatur ' + $chkPruefung.Id) | Out-Null; return $false }
+    }
+    $stufe = $chkPruefung.Stufe
+    if ($Automatisch -and $stufe -ne 'Automatisch') { return $false }
+    # Ohne automatische Reparatur wird auch Harmloses einzeln bestaetigt.
+    if (-not $Automatisch -and $stufe -eq 'Automatisch') { $stufe = 'Bestaetigen' }
+    $backup = @($chkPruefung.Backup)
+    if ($stufe -eq 'Gefaehrlich' -and $backup.Count -eq 0) { $backup = @('Config', 'Dhcp', 'Dns') }
+    $r = Invoke-NetChange -Titel ('Reparatur {0}: {1}' -f $chkPruefung.Id, $chkPruefung.Titel) -Stufe $stufe -Vorher ($chkPruefung.Problem + ' ' + $Ergebnis.Detail).Trim() -Nachher 'behoben' -Hinweis $chkPruefung.Erklaerung -BackupBereich $backup -Aktion {
+        & $chkReparatur $chkZustand $chkErgebnis
+    }
+    return [bool]($r.Erfolg -and -not $r.Probelauf)
+}
+#
+function Invoke-NetDoctor {
+    <#
+    .SYNOPSIS
+        Alle passenden Pruefungen ausfuehren, anzeigen, harmlose Fehler automatisch reparieren
+        (abschaltbar), weitere einzeln anbieten, danach erneut pruefen.
+    #>
+    param([string[]]$Kategorie, [switch]$NurPruefen, [switch]$Still)
+    Write-NetTitle -Titel 'Doktor: pruefen und reparieren'
+    Write-Log -Message 'Bestandsaufnahme ...'
+    $zustand = Get-NetSetupState
+    $pruefungen = @(Get-NetCheck -Kategorie $Kategorie)
+    Write-Log -Message ('{0} Pruefung(en) laufen ...' -f $pruefungen.Count)
+    $ergebnisse = @($pruefungen | ForEach-Object { Invoke-NetCheck -Pruefung $_ -Zustand $zustand })
+    if (-not $Still) { Show-NetCheckResult -Ergebnisse $ergebnisse }
+    $summe = Get-NetCheckSummary -Ergebnisse $ergebnisse
+    Write-Host ''
+    Write-Log -Message ('Ergebnis: ' + $summe.Text)
+    $script:NS.LetzterDoktor = $ergebnisse
+    if ($NurPruefen) { return $ergebnisse }
+#
+    $offen = @($ergebnisse | Where-Object { ($_.Status -eq 'FEHLER' -or $_.Status -eq 'WARN') -and $_.KannReparieren })
+    if ($offen.Count -eq 0) {
+        if ($summe.FEHLER + $summe.WARN -gt 0) { Write-Log -Message 'Fuer die gemeldeten Punkte gibt es keine automatische Reparatur. Die Erklaerung steht oben bzw. im Pruefkatalog.' }
+        return $ergebnisse
+    }
+    $repariert = @()
+    if ([bool](Get-NetConfigValue -Pfad 'Allgemein.AutoReparatur' -Standard $true)) {
+        foreach ($e in @($offen | Where-Object { $_.Stufe -eq 'Automatisch' })) {
+            if (Invoke-NetCheckRepair -Ergebnis $e -Zustand $zustand -Automatisch) { $repariert += $e.Id }
+        }
+    }
+    else { Write-Log -Message 'Automatische Reparatur ist in den Einstellungen ausgeschaltet.' }
+    $rest = @($offen | Where-Object { $repariert -notcontains $_.Id })
+    if ($rest.Count -gt 0 -and $script:NS.Interaktiv) {
+        Write-Host ''
+        Write-Log -Message ('{0} Punkt(e) koennen repariert werden. Jeder wird einzeln angeboten.' -f $rest.Count)
+        foreach ($e in $rest) {
+            if (Invoke-NetCheckRepair -Ergebnis $e -Zustand $zustand) { $repariert += $e.Id }
+        }
+    }
+    if ($repariert.Count -gt 0 -and -not (Test-NetDryRun)) {
+        Write-Log -Message 'Erneute Pruefung der reparierten Punkte ...'
+        $neuZustand = Get-NetSetupState
+        $nachher = @(Get-NetCheck -Id $repariert | ForEach-Object { Invoke-NetCheck -Pruefung $_ -Zustand $neuZustand })
+        Show-NetCheckResult -Ergebnisse $nachher
+        foreach ($n in $nachher) {
+            for ($i = 0; $i -lt $ergebnisse.Count; $i++) { if ($ergebnisse[$i].Id -eq $n.Id) { $ergebnisse[$i] = $n } }
+        }
+        Write-Log -Message ('Ergebnis nach der Reparatur: ' + (Get-NetCheckSummary -Ergebnisse $ergebnisse).Text)
+    }
+    $script:NS.LetzterDoktor = $ergebnisse
+    return $ergebnisse
+}
+#
+function Show-NetCheckCatalog {
+    Write-NetTitle -Titel 'Pruefkatalog des Doktors'
+    foreach ($p in (Get-NetCheck)) {
+        Write-Host ('  {0} [{1}] {2}' -f $p.Id, $p.Kategorie, $p.Titel) -ForegroundColor White
+        Write-NetText -Text ('    Problem   : ' + $p.Problem)
+        Write-NetText -Text ('    Erklaerung: ' + $p.Erklaerung)
+        $rep = 'keine automatische Reparatur'
+        if ($p.Reparatur) { $rep = 'Reparatur moeglich, Stufe ' + $p.Stufe }
+        Write-NetText -Text ('    Reparatur : ' + $rep) -Farbe DarkGray
+    }
+}
+#
+function Show-NetDcdiag {
+    <#
+    .SYNOPSIS
+        Fuehrt dcdiag aus und zeigt die Ausgabe unveraendert an (wird nicht ausgewertet).
+    #>
+    if (-not (Test-NetCommand -Name 'dcdiag.exe')) { Write-Log -Level Warn -Message 'dcdiag ist nicht vorhanden (nur auf DCs bzw. mit RSAT-ADDS).'; return }
+    Write-Log -Message 'dcdiag laeuft (das kann eine Minute dauern) ...'
+    $ausgabe = & dcdiag.exe /q 2>&1 | Out-String
+    if (-not $ausgabe.Trim()) { Write-Log -Level OK -Message 'dcdiag /q hat keine Fehler gemeldet.' }
+    else { Write-Host $ausgabe }
+    if (Read-NetYesNo -Frage 'Ausfuehrliche Ausgabe (dcdiag /v) anzeigen?' -Vorschlag $false) { & dcdiag.exe /v 2>&1 | Out-String | Write-Host }
+}
+#
+function Invoke-NetDoctorCategory {
+    $i = Read-NetChoice -Frage 'Welche Kategorie?' -Optionen $script:NetCheckKategorien -Vorschlag 1
+    if ($i -lt 0) { return }
+    Invoke-NetDoctor -Kategorie $script:NetCheckKategorien[$i] | Out-Null
+}
+#
+function Invoke-NetHealthTask {
+    <#
+    .SYNOPSIS
+        Aufgabe ohne Menue (-Task Health): alles pruefen, nichts aendern, Bericht ablegen.
+    #>
+    $ergebnisse = @(Invoke-NetDoctor -NurPruefen -Still)
+    if (Test-NetCommand -Name 'New-NetHealthReport') {
+        New-NetHealthReport -Ergebnisse $ergebnisse | Out-Null
+    }
+    else {
+        $datei = Join-Path -Path (Get-NetPath -Name Berichte) -ChildPath ('Doktor_{0}.csv' -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
+        $ergebnisse | Select-Object -Property Id, Kategorie, Titel, Status, Detail, Problem | Export-Csv -Path $datei -NoTypeInformation -Encoding UTF8 -Delimiter ';'
+        Write-Log -Level OK -Message ('Ergebnis gespeichert: ' + $datei)
+    }
+    $s = Get-NetCheckSummary -Ergebnisse $ergebnisse
+    if ($s.FEHLER -gt 0) { Write-Log -Level Fehler -Message ('Gesundheitspruefung: ' + $s.Text) }
+    elseif ($s.WARN -gt 0) { Write-Log -Level Warn -Message ('Gesundheitspruefung: ' + $s.Text) }
+    else { Write-Log -Level OK -Message ('Gesundheitspruefung: ' + $s.Text) }
+}
+#
+function Show-NetDoctorMenu {
+    $eintraege = @(
+        @{ Text = 'Alles pruefen und reparieren'; Aktion = { Invoke-NetDoctor | Out-Null }; Hilfe = "Fuehrt alle passenden Pruefungen aus und zeigt [OK]/[WARN]/[FEHLER].`nHarmloses (Stufe Automatisch, z. B. gestoppten Dienst starten) wird sofort repariert - abschaltbar in den Einstellungen.`nAlles andere wird einzeln angeboten; danach wird erneut geprueft. Der Probelauf gilt auch hier." },
+        @{ Text = 'Nur pruefen (nichts aendern)'; Aktion = { Invoke-NetDoctor -NurPruefen | Out-Null }; Hilfe = 'Zeigt den Zustand, ohne etwas zu reparieren.' },
+        @{ Text = 'Eine Kategorie pruefen'; Aktion = 'Invoke-NetDoctorCategory'; Hilfe = 'Rechte, Rollen, AD, Netzwerk, DHCP oder DNS einzeln pruefen.' },
+        @{ Text = 'Pruefkatalog anzeigen'; Aktion = 'Show-NetCheckCatalog'; Hilfe = 'Alle Pruefungen mit Problem, Erklaerung und Reparaturstufe.' },
+        @{ Text = 'dcdiag anzeigen (unveraendert)'; Aktion = 'Show-NetDcdiag'; Hilfe = 'Startet das Windows-Werkzeug dcdiag und zeigt dessen Ausgabe 1:1 (nur auf DCs).' },
+        @{ Text = 'Fremde DHCP-Server im Netz suchen'; Aktion = 'Show-NetForeignDhcpServer'; Hilfe = 'Schickt eine DHCP-Anfrage (DHCPDISCOVER) ins Netz und zeigt alle antwortenden Server. Fremde Server (z. B. ein Router mit eingeschaltetem DHCP) verteilen falsche Adressen.' }
+    )
+    Show-NetMenu -Titel 'Doktor' -Eintraege $eintraege
+}
+# ----------------------------------------------------------------------
+# src/doktor/Hilfen.ps1
+# ----------------------------------------------------------------------
+# Hilfsfunktionen fuer die Pruefungen des Doktors (alle nur mit Bordmitteln).
+#
+function Get-NetCurrentAccount {
+    <#
+    .SYNOPSIS
+        Liefert das angemeldete Konto und ob es ein lokales Konto ist.
+    #>
+    $name = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+    $teile = $name.Split('\')
+    $lokal = ($teile.Count -eq 2 -and $teile[0] -ieq [Environment]::MachineName)
+    return [pscustomobject]@{ Name = $name; IstLokal = $lokal }
+}
+#
+function Test-NetFirewallPortOpen {
+    <#
+    .SYNOPSIS
+        Prueft ueber Port und Protokoll (nicht ueber Regelnamen), ob eingehend erlaubt ist.
+        Ist die Firewall in keinem Profil aktiv, gilt der Port als offen.
+    #>
+    param([Parameter(Mandatory = $true)][ValidateSet('TCP', 'UDP')][string]$Protokoll, [Parameter(Mandatory = $true)][int]$Port)
+    $aktiveProfile = @(Get-NetFirewallProfile | Where-Object { [string]$_.Enabled -eq 'True' })
+    if ($aktiveProfile.Count -eq 0) { return $true }
+    foreach ($filter in @(Get-NetFirewallPortFilter -Protocol $Protokoll)) {
+        if ($null -eq $filter) { continue }
+        $ports = @($filter.LocalPort | ForEach-Object { [string]$_ })
+        $passt = ($ports -contains [string]$Port)
+        foreach ($p in $ports) {
+            if ($p -match '^(\d+)-(\d+)$' -and $Port -ge [int]$Matches[1] -and $Port -le [int]$Matches[2]) { $passt = $true }
+        }
+        if (-not $passt) { continue }
+        foreach ($regel in @($filter | Get-NetFirewallRule)) {
+            if ($regel -and [string]$regel.Enabled -eq 'True' -and [string]$regel.Direction -eq 'Inbound' -and [string]$regel.Action -eq 'Allow') { return $true }
+        }
+    }
+    return $false
+}
+#
+function New-NetFirewallPortRule {
+    <#
+    .SYNOPSIS
+        Legt eine eingehende Firewall-Regel fuer einen Port an (Gruppe NetSetup).
+    #>
+    param([Parameter(Mandatory = $true)][ValidateSet('TCP', 'UDP')][string]$Protokoll, [Parameter(Mandatory = $true)][int]$Port, [Parameter(Mandatory = $true)][string]$Zweck)
+    $name = 'NetSetup-{0}-{1}' -f $Protokoll, $Port
+    New-NetFirewallRule -Name $name -DisplayName ('NetSetup {0} ({1} {2})' -f $Zweck, $Protokoll, $Port) -Direction Inbound -Protocol $Protokoll -LocalPort $Port -Action Allow -Group 'NetSetup' -Profile 'Domain,Private' -Description 'Angelegt vom NetSetup-Doktor' | Out-Null
+}
+#
+function Resolve-NetDcSrvRecord {
+    param([Parameter(Mandatory = $true)][string]$Domaene)
+    $name = '_ldap._tcp.dc._msdcs.' + $Domaene
+    return (Get-NetSafe -Beschreibung "SRV $name" -Abfrage { Resolve-DnsName -Name $name -Type SRV -DnsOnly -QuickTimeout })
+}
+#
+function New-NetDhcpDiscoverPacket {
+    <#
+    .SYNOPSIS
+        Baut ein DHCPDISCOVER-Paket (RFC 2131) mit Broadcast-Flag und einer zufaelligen,
+        lokal verwalteten MAC-Adresse.
+    #>
+    param([byte[]]$Xid, [byte[]]$Mac)
+    $p = New-Object byte[] 300
+    $p[0] = 1; $p[1] = 1; $p[2] = 6; $p[3] = 0
+    [Array]::Copy($Xid, 0, $p, 4, 4)
+    $p[10] = 0x80
+    [Array]::Copy($Mac, 0, $p, 28, 6)
+    $p[236] = 99; $p[237] = 130; $p[238] = 83; $p[239] = 99
+    $p[240] = 53; $p[241] = 1; $p[242] = 1; $p[243] = 255
+    return $p
+}
+#
+function Find-NetForeignDhcpServer {
+    <#
+    .SYNOPSIS
+        Sendet ein DHCPDISCOVER (UDP 67) und sammelt alle DHCP-Server, die antworten.
+        Nur .NET-Bordmittel (UdpClient). Liefert die Adressen der antwortenden Server
+        oder $null, wenn die Pruefung nicht moeglich war (z. B. Port 68 belegt).
+    #>
+    param([int]$WarteSekunden = 4)
+    $udp = $null
+    try {
+        $udp = New-Object System.Net.Sockets.UdpClient
+        $udp.Client.SetSocketOption([System.Net.Sockets.SocketOptionLevel]::Socket, [System.Net.Sockets.SocketOptionName]::ReuseAddress, $true)
+        $udp.Client.Bind((New-Object System.Net.IPEndPoint([System.Net.IPAddress]::Any, 68)))
+        $udp.EnableBroadcast = $true
+        $udp.Client.ReceiveTimeout = 1000
+        $zufall = New-Object System.Random
+        $xid = New-Object byte[] 4
+        $zufall.NextBytes($xid)
+        $mac = New-Object byte[] 6
+        $zufall.NextBytes($mac)
+        $mac[0] = ($mac[0] -band 0xFC) -bor 0x02
+        $paket = New-NetDhcpDiscoverPacket -Xid $xid -Mac $mac
+        $ziel = New-Object System.Net.IPEndPoint([System.Net.IPAddress]::Broadcast, 67)
+        [void]$udp.Send($paket, $paket.Length, $ziel)
+        $server = @()
+        $ende = (Get-Date).AddSeconds($WarteSekunden)
+        while ((Get-Date) -lt $ende) {
+            try {
+                $ep = New-Object System.Net.IPEndPoint([System.Net.IPAddress]::Any, 0)
+                $antwort = $udp.Receive([ref]$ep)
+            }
+            catch { continue }
+            if ($antwort.Length -lt 240 -or $antwort[0] -ne 2) { continue }
+            if ($antwort[4] -ne $xid[0] -or $antwort[5] -ne $xid[1] -or $antwort[6] -ne $xid[2] -or $antwort[7] -ne $xid[3]) { continue }
+            $kennung = $ep.Address.ToString()
+            $i = 240
+            while ($i -lt $antwort.Length - 1) {
+                $code = $antwort[$i]
+                if ($code -eq 255) { break }
+                if ($code -eq 0) { $i++; continue }
+                $laenge = $antwort[$i + 1]
+                if ($code -eq 54 -and $laenge -eq 4) { $kennung = '{0}.{1}.{2}.{3}' -f $antwort[$i + 2], $antwort[$i + 3], $antwort[$i + 4], $antwort[$i + 5] }
+                $i += 2 + $laenge
+            }
+            if ($server -notcontains $kennung) { $server += $kennung }
+        }
+        return $server
+    }
+    catch {
+        Write-Log -Level Debug -Message ('DHCP-Suche nicht moeglich: ' + $_.Exception.Message)
+        return $null
+    }
+    finally {
+        if ($udp) { $udp.Close() }
+    }
+}
+#
+function Get-NetKnownDhcpServer {
+    <#
+    .SYNOPSIS
+        Eigene Adressen und im AD autorisierte DHCP-Server (diese gelten nicht als fremd).
+    #>
+    param([hashtable]$Zustand)
+    $bekannt = @($Zustand.Netzwerk.EigeneIPs)
+    foreach ($s in @(Get-NetSafe -Beschreibung 'Get-DhcpServerInDC' -Standard @() -Abfrage { Get-DhcpServerInDC })) {
+        if ($s -and $s.IPAddress) { $bekannt += (ConvertTo-NetString $s.IPAddress) }
+    }
+    foreach ($f in @($Zustand.Dhcp.Failover)) {
+        $ip = Get-NetSafe -Beschreibung 'Partner' -Abfrage { (Resolve-DnsName -Name $f.Partner -Type A -DnsOnly -QuickTimeout | Select-Object -First 1).IPAddress }
+        if ($ip) { $bekannt += [string]$ip }
+    }
+    return @($bekannt | Select-Object -Unique)
+}
+#
+function Show-NetForeignDhcpServer {
+    Write-Log -Message 'Sende DHCPDISCOVER und warte 4 Sekunden auf Antworten ...'
+    Write-NetText -Text 'Hinweis: Ein DHCP-Server, der antwortet, reserviert die angebotene Adresse kurz fuer die Test-MAC. Das ist harmlos und laeuft von selbst ab.'
+    $z = Get-NetSetupState
+    $server = Find-NetForeignDhcpServer
+    if ($null -eq $server) { Write-Log -Level Warn -Message 'Die Suche war nicht moeglich (UDP-Port 68 belegt oder gesperrt).'; return }
+    $bekannt = Get-NetKnownDhcpServer -Zustand $z
+    if (@($server).Count -eq 0) { Write-Log -Level Warn -Message 'Kein DHCP-Server hat geantwortet (auch dieser nicht - Bindung, Scope oder Firewall pruefen).'; return }
+    foreach ($s in $server) {
+        if ($bekannt -contains $s) { Write-NetStatus -Status OK -Bereich $s -Text 'bekannter DHCP-Server' }
+        else { Write-NetStatus -Status FEHLER -Bereich $s -Text 'FREMDER DHCP-Server - verteilt evtl. falsche Adressen (Router/WLAN-Box?)' }
+    }
+}
+#
+function Get-NetDuplicateDnsRecord {
+    <#
+    .SYNOPSIS
+        Findet doppelte A-Eintraege: gleicher Name mit mehreren IPs bzw. gleiche IP unter mehreren Namen
+        (nur dynamische Eintraege; statische Round-Robin-Eintraege sind gewollt).
+    #>
+    param([string[]]$Zonen)
+    $doppelt = @()
+    foreach ($zone in $Zonen) {
+        $a = @(Get-NetDnsRecord -Zone $zone -Typ 'A' | Where-Object { -not $_.Statisch -and $_.Name -ne '@' -and $_.Name -notlike 'DomainDnsZones*' -and $_.Name -notlike 'ForestDnsZones*' })
+        foreach ($g in @($a | Group-Object -Property Name | Where-Object { $_.Count -gt 1 })) {
+            $doppelt += [pscustomobject]@{ Zone = $zone; Art = 'Name mit mehreren IPs'; Wert = $g.Name; Liste = (($g.Group | ForEach-Object { $_.Wert }) -join ', ') }
+        }
+        foreach ($g in @($a | Group-Object -Property Wert | Where-Object { $_.Count -gt 1 })) {
+            $doppelt += [pscustomobject]@{ Zone = $zone; Art = 'IP unter mehreren Namen'; Wert = $g.Name; Liste = (($g.Group | ForEach-Object { $_.Name }) -join ', ') }
+        }
+    }
+    return $doppelt
+}
+#
+function Get-NetDnsCredentialAccountState {
+    <#
+    .SYNOPSIS
+        Prueft das Konto der DHCP-DNS-Zugangsdaten im AD (aktiv, Kennwort nicht abgelaufen).
+        Liefert $null, wenn das nicht pruefbar ist.
+    #>
+    param([Parameter(Mandatory = $true)][string]$Benutzer)
+    if (-not (Test-NetCommand -Name 'Get-ADUser')) { return $null }
+    $u = Get-NetSafe -Beschreibung "Konto $Benutzer" -Abfrage { Get-ADUser -Identity $Benutzer -Properties Enabled, PasswordExpired, AccountExpirationDate, LockedOut }
+    if (-not $u) { return [pscustomobject]@{ Vorhanden = $false; Problem = "Das Konto $Benutzer gibt es im AD nicht (mehr)." } }
+    $problem = ''
+    if (-not $u.Enabled) { $problem = "Das Konto $Benutzer ist deaktiviert." }
+    elseif ($u.PasswordExpired) { $problem = "Das Kennwort von $Benutzer ist abgelaufen." }
+    elseif ($u.LockedOut) { $problem = "Das Konto $Benutzer ist gesperrt." }
+    elseif ($u.AccountExpirationDate -and ([datetime]$u.AccountExpirationDate) -lt (Get-Date)) { $problem = "Das Konto $Benutzer ist abgelaufen." }
+    return [pscustomobject]@{ Vorhanden = $true; Problem = $problem }
+}
+# ----------------------------------------------------------------------
+# src/checks/A01-AdDienste.ps1
+# ----------------------------------------------------------------------
+# Pruefung A01: NTDS und Netlogon laufen auf dem DC.
+Register-NetCheck @{
+    Id            = 'A01'
+    Kategorie     = 'AD'
+    Titel         = 'AD-Dienste (NTDS, Netlogon)'
+    Problem       = 'AD-Dienste laufen nicht:'
+    Erklaerung    = 'Ohne NTDS und Netlogon funktioniert die Anmeldung an der Domaene nicht. Die Reparatur startet die Dienste.'
+    Stufe         = 'Automatisch'
+    Voraussetzung = { param($Z) $Z.System.IstDC }
+    Test          = {
+        param($Z)
+        $aus = @(@('NTDS', 'Netlogon') | Where-Object { -not $Z.Dienste[$_] -or $Z.Dienste[$_].Status -ne 'Running' })
+        if ($aus.Count -gt 0) { return (New-NetCheckResult FEHLER ($aus -join ', ') $aus) }
+        New-NetCheckResult OK 'NTDS und Netlogon laufen'
+    }
+    Reparatur     = { param($Z, $E) $null = $Z; foreach ($d in @($E.Daten)) { Start-Service -Name $d } }
+}
+# ----------------------------------------------------------------------
+# src/checks/A02-Freigaben.ps1
+# ----------------------------------------------------------------------
+# Pruefung A02: Freigaben SYSVOL und NETLOGON auf dem DC.
+Register-NetCheck @{
+    Id            = 'A02'
+    Kategorie     = 'AD'
+    Titel         = 'Freigaben SYSVOL und NETLOGON'
+    Problem       = 'Freigaben fehlen:'
+    Erklaerung    = 'Ohne SYSVOL/NETLOGON gibt es keine Gruppenrichtlinien und Anmeldescripts. Nach einer frischen Heraufstufung dauert es einige Minuten. Die Reparatur startet Netlogon neu; hilft das nicht, die SYSVOL-Replikation (DFSR) in der Ereignisanzeige pruefen.'
+    Stufe         = 'Bestaetigen'
+    Voraussetzung = { param($Z) $Z.System.IstDC }
+    Test          = {
+        $fehlend = @(@('SYSVOL', 'NETLOGON') | Where-Object { $n = $_; -not (Get-NetSafe -Beschreibung "Freigabe $n" -Abfrage { Get-SmbShare -Name $n }) })
+        if ($fehlend.Count -gt 0) { return (New-NetCheckResult FEHLER ($fehlend -join ', ')) }
+        New-NetCheckResult OK 'vorhanden'
+    }
+    Reparatur     = { Restart-Service -Name Netlogon -Force }
+}
+# ----------------------------------------------------------------------
+# src/checks/A03-DcSrvEintrag.ps1
+# ----------------------------------------------------------------------
+# Pruefung A03: _ldap._tcp.dc._msdcs.<domaene> ist aufloesbar.
+Register-NetCheck @{
+    Id            = 'A03'
+    Kategorie     = 'AD'
+    Titel         = 'DC-Eintrag im DNS (SRV)'
+    Problem       = 'Der Eintrag _ldap._tcp.dc._msdcs.<Domaene> laesst sich nicht aufloesen.'
+    Erklaerung    = 'Clients finden Domaenencontroller ueber diesen SRV-Eintrag. Fehlt er, scheitern Beitritt und Anmeldung. Ursachen: DNS-Client zeigt nicht auf einen DC, Zone _msdcs fehlt, Netlogon hat sich nicht registriert. Die Reparatur startet Netlogon neu (registriert die Eintraege erneut).'
+    Stufe         = 'Bestaetigen'
+    Voraussetzung = { param($Z) ($Z.System.IstDC -or $Z.System.IstMitglied) -and (Get-NetDomainName -Zustand $Z) }
+    Test          = {
+        param($Z)
+        $d = Get-NetDomainName -Zustand $Z
+        if (Resolve-NetDcSrvRecord -Domaene $d) { New-NetCheckResult OK ('_ldap._tcp.dc._msdcs.' + $d) }
+        else { New-NetCheckResult FEHLER ('(' + $d + ')') }
+    }
+    Reparatur     = {
+        param($Z)
+        if (-not $Z.System.IstDC) { throw 'Auf einem Mitgliedsserver kann der Eintrag nicht repariert werden: DNS-Client pruefen (N02) oder auf dem DC reparieren.' }
+        Restart-Service -Name Netlogon -Force
+    }
+}
+# ----------------------------------------------------------------------
+# src/checks/A04-PdcZeitquelle.ps1
+# ----------------------------------------------------------------------
+# Pruefung A04: PDC-Emulator holt die Zeit von einer externen Quelle.
+Register-NetCheck @{
+    Id            = 'A04'
+    Kategorie     = 'AD'
+    Titel         = 'Zeitquelle des PDC'
+    Problem       = 'Der PDC-Emulator hat keine externe Zeitquelle.'
+    Erklaerung    = 'Alle Rechner der Domaene folgen der Uhr des PDC. Er sollte die Zeit per NTP von aussen holen (z. B. ch.pool.ntp.org oder vom Router).'
+    Stufe         = 'Bestaetigen'
+    Interaktiv    = $true
+    Voraussetzung = { param($Z) $Z.System.IstPdc }
+    Test          = {
+        param($Z)
+        if ($Z.Zeit.Typ -eq 'NTP' -and $Z.Zeit.NtpServer) { New-NetCheckResult OK $Z.Zeit.NtpServer }
+        else { New-NetCheckResult WARN ('(Typ ' + $Z.Zeit.Typ + ')') }
+    }
+    Reparatur     = { Set-NetPdcTimeSource }
+}
+# ----------------------------------------------------------------------
+# src/checks/D01-NichtAutorisiert.ps1
+# ----------------------------------------------------------------------
+# Pruefung D01: DHCP-Server ist im AD autorisiert.
+Register-NetCheck @{
+    Id            = 'D01'
+    Kategorie     = 'DHCP'
+    Titel         = 'Autorisierung im AD'
+    Problem       = 'Der DHCP-Server ist nicht im AD autorisiert und vergibt deshalb keine Adressen.'
+    Erklaerung    = 'In einer Domaene muss jeder Windows-DHCP-Server autorisiert sein (Add-DhcpServerInDC). Dafuer braucht es Organisations-Admins.'
+    Stufe         = 'Bestaetigen'
+    Interaktiv    = $true
+    Voraussetzung = { param($Z) $Z.Dhcp.Verfuegbar -and $Z.Dhcp.InDomaene }
+    Test          = {
+        param($Z)
+        if ($Z.Dhcp.Autorisiert) { New-NetCheckResult OK 'autorisiert' }
+        else { New-NetCheckResult FEHLER '' }
+    }
+    Reparatur     = { Add-NetDhcpAuthorization }
+}
+# ----------------------------------------------------------------------
+# src/checks/D02-ScopeInaktiv.ps1
+# ----------------------------------------------------------------------
+# Pruefung D02: Alle Scopes sind aktiv.
+Register-NetCheck @{
+    Id            = 'D02'
+    Kategorie     = 'DHCP'
+    Titel         = 'Inaktive Scopes'
+    Problem       = 'Diese Scopes sind deaktiviert:'
+    Erklaerung    = 'Ein deaktivierter Scope vergibt keine Adressen. Gewollt ist das nur waehrend Umbauten. Die Reparatur aktiviert die Scopes.'
+    Stufe         = 'Bestaetigen'
+    Backup        = @('Dhcp')
+    Voraussetzung = { param($Z) $Z.Dhcp.Verfuegbar -and @($Z.Dhcp.Scopes).Count -gt 0 }
+    Test          = {
+        param($Z)
+        $inaktiv = @($Z.Dhcp.Scopes | Where-Object { -not $_.Aktiv } | ForEach-Object { $_.ScopeId })
+        if ($inaktiv.Count -gt 0) { return (New-NetCheckResult WARN ($inaktiv -join ', ') $inaktiv) }
+        New-NetCheckResult OK 'alle aktiv'
+    }
+    Reparatur     = { param($Z, $E) $null = $Z; foreach ($id in @($E.Daten)) { Set-DhcpServerv4Scope -ScopeId $id -State Active } }
+}
+# ----------------------------------------------------------------------
+# src/checks/D03-Auslastung.ps1
+# ----------------------------------------------------------------------
+# Pruefung D03: Auslastung der Scopes (Warnung ab 80 %, Fehler ab 90 %).
+Register-NetCheck @{
+    Id            = 'D03'
+    Kategorie     = 'DHCP'
+    Titel         = 'Auslastung der Scopes'
+    Problem       = 'Scopes sind fast voll:'
+    Erklaerung    = 'Ist ein Scope voll, bekommen neue Geraete keine Adresse. Abhilfe: Bereich vergroessern, Ausschluesse verkleinern, Lease-Dauer verkuerzen (z. B. Gaeste-WLAN 1 Tag) oder ein groesseres Netz planen.'
+    Stufe         = 'Bestaetigen'
+    Voraussetzung = { param($Z) $Z.Dhcp.Verfuegbar -and @($Z.Dhcp.Scopes | Where-Object { $_.Aktiv }).Count -gt 0 }
+    Test          = {
+        param($Z)
+        $warnung = [int](Get-NetConfigValue -Pfad 'Vorschlaege.AuslastungWarnung' -Standard 80)
+        $fehler = [int](Get-NetConfigValue -Pfad 'Vorschlaege.AuslastungFehler' -Standard 90)
+        $voll = @($Z.Dhcp.Scopes | Where-Object { $_.Aktiv -and $_.Auslastung -ge $fehler })
+        $knapp = @($Z.Dhcp.Scopes | Where-Object { $_.Aktiv -and $_.Auslastung -ge $warnung -and $_.Auslastung -lt $fehler })
+        $text = ((@($voll) + @($knapp)) | ForEach-Object { '{0} {1:N0}%' -f $_.ScopeId, $_.Auslastung }) -join ', '
+        if ($voll.Count -gt 0) { return (New-NetCheckResult FEHLER $text) }
+        if ($knapp.Count -gt 0) { return (New-NetCheckResult WARN $text) }
+        New-NetCheckResult OK ((@($Z.Dhcp.Scopes | Where-Object { $_.Aktiv }) | ForEach-Object { '{0} {1:N0}%' -f $_.ScopeId, $_.Auslastung }) -join ', ')
+    }
+}
+# ----------------------------------------------------------------------
+# src/checks/D04-Optionen.ps1
+# ----------------------------------------------------------------------
+# Pruefung D04: Optionen 003, 006 und 015 sind gesetzt und zeigen richtig.
+Register-NetCheck @{
+    Id            = 'D04'
+    Kategorie     = 'DHCP'
+    Titel         = 'Optionen 003/006/015'
+    Problem       = 'Optionen fehlen oder zeigen falsch:'
+    Erklaerung    = 'Ohne Router (003) kommen Clients nicht aus dem Netz, ohne DNS-Server (006) loesen sie keine Namen auf, ohne Domaene (015) fehlt der DNS-Suffix. In einer Domaene muss 006 auf die DCs zeigen.'
+    Stufe         = 'Bestaetigen'
+    Interaktiv    = $true
+    Voraussetzung = { param($Z) $Z.Dhcp.Verfuegbar -and @($Z.Dhcp.Scopes).Count -gt 0 }
+    Test          = {
+        param($Z)
+        $probleme = @()
+        $fehler = $false
+        $dcs = @()
+        if ($Z.System.IstDC -or $Z.System.IstMitglied) { $dcs = @(Get-NetDcAddress -Zustand $Z) }
+        foreach ($s in $Z.Dhcp.Scopes) {
+            foreach ($nr in @('3', '6', '15')) {
+                if (-not $s.Optionen.ContainsKey($nr) -and -not $Z.Dhcp.ServerOptionen.ContainsKey($nr)) { $probleme += ('{0}: {1} fehlt' -f $s.ScopeId, $nr); if ($nr -ne '15') { $fehler = $true } }
+            }
+            $router = @($s.Optionen['3'])
+            if ($router.Count -gt 0 -and $router[0] -and $s.Prefix -gt 0 -and -not (Test-NetIPInSubnet -IPAddress $router[0] -NetworkAddress $s.ScopeId -PrefixLength $s.Prefix)) { $probleme += ('{0}: Router {1} liegt nicht im Netz' -f $s.ScopeId, $router[0]); $fehler = $true }
+            $dns = @($s.Optionen['6'])
+            if ($dns.Count -eq 0) { $dns = @($Z.Dhcp.ServerOptionen['6']) }
+            if ($dcs.Count -gt 0 -and @($dns | Where-Object { $_ -and $dcs -notcontains $_ }).Count -gt 0) { $probleme += ('{0}: DNS {1} ist kein DC' -f $s.ScopeId, ((@($dns | Where-Object { $dcs -notcontains $_ })) -join ',')); $fehler = $true }
+        }
+        if ($probleme.Count -eq 0) { return (New-NetCheckResult OK 'vollstaendig') }
+        if ($fehler) { return (New-NetCheckResult FEHLER ($probleme -join '; ')) }
+        New-NetCheckResult WARN ($probleme -join '; ')
+    }
+    Reparatur     = { Set-NetDhcpStandardOption }
+}
+# ----------------------------------------------------------------------
+# src/checks/D05-ReservierungAusserhalb.ps1
+# ----------------------------------------------------------------------
+# Pruefung D05: Reservierungen liegen im Scope-Bereich und nicht in einem Ausschluss.
+Register-NetCheck @{
+    Id            = 'D05'
+    Kategorie     = 'DHCP'
+    Titel         = 'Reservierungen'
+    Problem       = 'Reservierungen liegen ausserhalb des Bereichs oder in einem Ausschluss:'
+    Erklaerung    = 'Solche Reservierungen funktionieren nicht wie erwartet. Die Reservierung loeschen und mit einer Adresse im Bereich neu anlegen (Menue DHCP -> Reservierungen).'
+    Stufe         = 'Bestaetigen'
+    Voraussetzung = { param($Z) $Z.Dhcp.Verfuegbar -and @($Z.Dhcp.Scopes | ForEach-Object { $_.Reservierungen }).Count -gt 0 }
+    Test          = {
+        param($Z)
+        $probleme = @()
+        foreach ($s in $Z.Dhcp.Scopes) {
+            foreach ($r in @($s.Reservierungen)) {
+                if (-not (Test-NetIPInRange -IPAddress $r.IP -Start $s.Start -Ende $s.Ende)) { $probleme += ('{0} ({1}) ausserhalb' -f $r.IP, $r.Name); continue }
+                foreach ($a in @($s.Ausschluesse)) { if (Test-NetIPInRange -IPAddress $r.IP -Start $a.Start -Ende $a.Ende) { $probleme += ('{0} ({1}) im Ausschluss' -f $r.IP, $r.Name) } }
+            }
+        }
+        if ($probleme.Count -gt 0) { return (New-NetCheckResult WARN ($probleme -join ', ')) }
+        New-NetCheckResult OK 'alle im Bereich'
+    }
+}
+# ----------------------------------------------------------------------
+# src/checks/D06-IpKonflikt.ps1
+# ----------------------------------------------------------------------
+# Pruefung D06: IP-Konflikte (feste Adressen im Bereich, abgelehnte Adressen).
+Register-NetCheck @{
+    Id            = 'D06'
+    Kategorie     = 'DHCP'
+    Titel         = 'IP-Konflikte'
+    Problem       = 'Moegliche IP-Konflikte:'
+    Erklaerung    = 'Liegt eine feste Adresse (Server, Router) im DHCP-Bereich, kann sie doppelt vergeben werden. Die Reparatur traegt diese Adressen als Ausschluss ein. Abgelehnte Adressen (Declined) deuten auf Geraete mit fest eingetragener IP hin - Konflikterkennung einschalten.'
+    Stufe         = 'Bestaetigen'
+    Backup        = @('Dhcp')
+    Voraussetzung = { param($Z) $Z.Dhcp.Verfuegbar -and @($Z.Dhcp.Scopes).Count -gt 0 }
+    Test          = {
+        param($Z)
+        $fest = @($Z.Netzwerk.EigeneIPs)
+        foreach ($k in @($Z.Netzwerk.AktiveKarten)) { $fest += @($k.Gateway) }
+        $treffer = @()
+        foreach ($s in $Z.Dhcp.Scopes) {
+            foreach ($ip in @($fest | Where-Object { $_ } | Select-Object -Unique)) {
+                if (-not (Test-NetIPInRange -IPAddress $ip -Start $s.Start -Ende $s.Ende)) { continue }
+                $aus = @($s.Ausschluesse | Where-Object { Test-NetIPInRange -IPAddress $ip -Start $_.Start -Ende $_.Ende })
+                $res = @($s.Reservierungen | Where-Object { $_.IP -eq $ip })
+                if ($aus.Count -eq 0 -and $res.Count -eq 0) { $treffer += @{ ScopeId = $s.ScopeId; IP = $ip } }
+            }
+        }
+        $abgelehnt = @()
+        foreach ($s in $Z.Dhcp.Scopes) {
+            $id = $s.ScopeId
+            $abgelehnt += @(Get-NetSafe -Beschreibung 'Leases' -Standard @() -Abfrage { Get-DhcpServerv4Lease -ScopeId $id } | Where-Object { $_ -and [string]$_.AddressState -like '*Declined*' } | ForEach-Object { ConvertTo-NetString $_.IPAddress })
+        }
+        if ($treffer.Count -gt 0) { return (New-NetCheckResult FEHLER (('feste Adresse im Bereich: ' + (($treffer | ForEach-Object { $_.IP }) -join ', ')) + $(if ($abgelehnt.Count) { '; abgelehnt: ' + ($abgelehnt -join ', ') } else { '' })) $treffer) }
+        if ($abgelehnt.Count -gt 0) { return (New-NetCheckResult WARN ('abgelehnte Adressen: ' + ($abgelehnt -join ', '))) }
+        New-NetCheckResult OK 'keine Konflikte gefunden'
+    }
+    Reparatur     = { param($Z, $E) $null = $Z; foreach ($t in @($E.Daten)) { if ($t.IP) { Add-DhcpServerv4ExclusionRange -ScopeId $t.ScopeId -StartRange $t.IP -EndRange $t.IP } } }
+}
+# ----------------------------------------------------------------------
+# src/checks/D07-FailoverSync.ps1
+# ----------------------------------------------------------------------
+# Pruefung D07: DHCP-Failover ist im Zustand Normal.
+Register-NetCheck @{
+    Id            = 'D07'
+    Kategorie     = 'DHCP'
+    Titel         = 'Failover-Zustand'
+    Problem       = 'Failover ist nicht synchron:'
+    Erklaerung    = 'Normal ist der Zustand "Normal". CommunicationInterrupted bedeutet, dass der Partner nicht erreichbar ist (Netz, Dienst, Firewall TCP 647). Nach Aenderungen an Optionen oder Reservierungen die Replikation ausloesen.'
+    Stufe         = 'Bestaetigen'
+    Interaktiv    = $true
+    Voraussetzung = { param($Z) $Z.Dhcp.Verfuegbar -and @($Z.Dhcp.Failover).Count -gt 0 }
+    Test          = {
+        param($Z)
+        $nicht = @($Z.Dhcp.Failover | Where-Object { $_.Status -ne 'Normal' })
+        if ($nicht.Count -gt 0) { return (New-NetCheckResult WARN (($nicht | ForEach-Object { '{0} ({1})' -f $_.Name, $_.Status }) -join ', ')) }
+        New-NetCheckResult OK 'Normal'
+    }
+    Reparatur     = { Sync-NetDhcpFailover }
+}
+# ----------------------------------------------------------------------
+# src/checks/D08-FremderDhcp.ps1
+# ----------------------------------------------------------------------
+# Pruefung D08: Kein fremder DHCP-Server im Netz (DHCPDISCOVER mit UdpClient).
+Register-NetCheck @{
+    Id            = 'D08'
+    Kategorie     = 'DHCP'
+    Titel         = 'Fremde DHCP-Server'
+    Problem       = 'Ein fremder DHCP-Server antwortet im Netz:'
+    Erklaerung    = 'Ein zweiter, unbekannter DHCP-Server (oft ein Router oder eine WLAN-Box mit eingeschaltetem DHCP) verteilt falsche Adressen, Gateways und DNS-Server. Dort DHCP ausschalten.'
+    Stufe         = 'Bestaetigen'
+    Voraussetzung = { param($Z) $Z.Dhcp.Verfuegbar -or $Z.System.IstDC }
+    Test          = {
+        param($Z)
+        $server = Find-NetForeignDhcpServer
+        if ($null -eq $server) { return (New-NetCheckResult NA 'Suche nicht moeglich (UDP 68 belegt)') }
+        $bekannt = Get-NetKnownDhcpServer -Zustand $Z
+        $fremd = @($server | Where-Object { $bekannt -notcontains $_ })
+        if ($fremd.Count -gt 0) { return (New-NetCheckResult FEHLER ($fremd -join ', ') $fremd) }
+        New-NetCheckResult OK ('kein fremder Server ({0} Antwort(en))' -f @($server).Count)
+    }
+}
+# ----------------------------------------------------------------------
+# src/checks/N01-FesteIp.ps1
+# ----------------------------------------------------------------------
+# Pruefung N01: Der Server hat eine feste IP-Adresse.
+Register-NetCheck @{
+    Id         = 'N01'
+    Kategorie  = 'Netzwerk'
+    Titel      = 'Feste IP-Adresse'
+    Problem    = 'Der Server bezieht seine IP per DHCP:'
+    Erklaerung = 'DCs, DNS- und DHCP-Server brauchen eine feste IP, sonst finden Clients sie nach einer Aenderung nicht mehr (und der DHCP-Server bindet nicht). Die Reparatur setzt eine feste IP (gefaehrlich: Remotedesktop kann getrennt werden).'
+    Stufe      = 'Gefaehrlich'
+    Interaktiv = $true
+    Test       = {
+        param($Z)
+        $karten = @($Z.Netzwerk.AktiveKarten)
+        if ($karten.Count -eq 0) { return (New-NetCheckResult FEHLER 'keine aktive Netzwerkkarte') }
+        $dhcp = @($karten | Where-Object { $_.Dhcp })
+        if ($dhcp.Count -eq 0) { return (New-NetCheckResult OK 'statisch') }
+        $status = 'WARN'
+        if ($Z.System.IstDC -or $Z.Dns.Installiert -or $Z.Dhcp.Installiert) { $status = 'FEHLER' }
+        New-NetCheckResult $status (($dhcp | ForEach-Object { $_.Name }) -join ', ') $dhcp[0]
+    }
+    Reparatur  = { param($Z, $E) $null = $Z; Set-NetStaticAddress -Karte $E.Daten }
+}
+# ----------------------------------------------------------------------
+# src/checks/N02-FremderDns.ps1
+# ----------------------------------------------------------------------
+# Pruefung N02: Der Server fragt die richtigen DNS-Server (DC: sich selbst bzw. andere DCs).
+Register-NetCheck @{
+    Id            = 'N02'
+    Kategorie     = 'Netzwerk'
+    Titel         = 'DNS-Client des Servers'
+    Problem       = 'Der Server fragt fremde DNS-Server:'
+    Erklaerung    = 'In einer Domaene muessen alle Rechner (auch Server und DCs) nur die DCs als DNS fragen. Oeffentliche Server wie 8.8.8.8 kennen die Domaene nicht - Anmeldung, Gruppenrichtlinien und Replikation scheitern. Internet-Namen loest der DC ueber Weiterleitungen auf.'
+    Stufe         = 'Bestaetigen'
+    Interaktiv    = $true
+    Voraussetzung = { param($Z) ($Z.System.IstDC -or $Z.System.IstMitglied) -and @($Z.Netzwerk.AktiveKarten).Count -gt 0 }
+    Test          = {
+        param($Z)
+        $karte = @($Z.Netzwerk.AktiveKarten)[0]
+        $erlaubt = @(Get-NetDcAddress -Zustand $Z) + @($Z.Netzwerk.EigeneIPs)
+        if ($Z.System.IstDC) { $erlaubt += '127.0.0.1' }
+        $dns = @($karte.DnsServer)
+        if ($dns.Count -eq 0) { return (New-NetCheckResult FEHLER 'kein DNS-Server eingetragen' $karte) }
+        $fremd = @($dns | Where-Object { $erlaubt -notcontains $_ })
+        if ($fremd.Count -gt 0) { return (New-NetCheckResult FEHLER ($fremd -join ', ') $karte) }
+        if ($Z.System.IstDC -and @($dns | Where-Object { $Z.Netzwerk.EigeneIPs -contains $_ -or $_ -eq '127.0.0.1' }).Count -eq 0) {
+            return (New-NetCheckResult WARN '(der DC fragt sich selbst nicht)' $karte)
+        }
+        New-NetCheckResult OK ($dns -join ', ')
+    }
+    Reparatur     = {
+        param($Z, $E)
+        $soll = @(Get-NetDcAddress -Zustand $Z)
+        if ($Z.System.IstDC) {
+            $eigene = @($Z.Netzwerk.EigeneIPs)[0]
+            $andere = @($soll | Where-Object { $Z.Netzwerk.EigeneIPs -notcontains $_ })
+            $soll = @($andere | Select-Object -First 1) + @($eigene, '127.0.0.1')
+        }
+        Set-NetDnsClient -Karte $E.Daten -Server @($soll | Where-Object { $_ }) -Grund 'Nur DCs als DNS-Server verwenden.'
+    }
+}
+# ----------------------------------------------------------------------
+# src/checks/N03-DhcpBindung.ps1
+# ----------------------------------------------------------------------
+# Pruefung N03: Der DHCP-Server ist an die richtige Netzwerkkarte gebunden.
+Register-NetCheck @{
+    Id            = 'N03'
+    Kategorie     = 'Netzwerk'
+    Titel         = 'DHCP-Bindung'
+    Problem       = 'Der DHCP-Server ist an die falsche oder keine Netzwerkkarte gebunden:'
+    Erklaerung    = 'Der DHCP-Server antwortet nur auf gebundenen Karten. Gebunden sein sollten die Karten im Netz der Clients (bzw. die Karte, an die das DHCP-Relay weiterleitet).'
+    Stufe         = 'Bestaetigen'
+    Interaktiv    = $true
+    Voraussetzung = { param($Z) $Z.Dhcp.Verfuegbar -and @($Z.Dhcp.Bindungen).Count -gt 0 }
+    Test          = {
+        param($Z)
+        $aktiv = @($Z.Dhcp.Bindungen | Where-Object { $_.Aktiv })
+        if ($aktiv.Count -eq 0) { return (New-NetCheckResult FEHLER 'keine Karte gebunden') }
+        $probleme = @()
+        foreach ($b in $Z.Dhcp.Bindungen) {
+            $karte = @($Z.Netzwerk.Karten | Where-Object { $_.Name -eq $b.Karte }) | Select-Object -First 1
+            if (-not $karte -or -not $b.IP) { continue }
+            $adr = @($karte.Adressen | Where-Object { $_.IP -eq $b.IP }) | Select-Object -First 1
+            if (-not $adr) { continue }
+            $hatScope = @($Z.Dhcp.Scopes | Where-Object { $_.Prefix -gt 0 -and (Test-NetIPInSubnet -IPAddress $b.IP -NetworkAddress $_.ScopeId -PrefixLength $_.Prefix) }).Count -gt 0
+            if ($hatScope -and -not $b.Aktiv) { $probleme += ('{0} hat einen Scope, ist aber nicht gebunden' -f $b.Karte) }
+        }
+        if ($probleme.Count -gt 0) { return (New-NetCheckResult WARN ($probleme -join '; ')) }
+        New-NetCheckResult OK (($aktiv | ForEach-Object { $_.Karte }) -join ', ')
+    }
+    Reparatur     = { Set-NetDhcpBinding }
+}
+# ----------------------------------------------------------------------
+# src/checks/N04-Firewall53.ps1
+# ----------------------------------------------------------------------
+# Pruefung N04: Firewall erlaubt DNS (Port 53 UDP und TCP) eingehend.
+Register-NetCheck @{
+    Id            = 'N04'
+    Kategorie     = 'Netzwerk'
+    Titel         = 'Firewall DNS (Port 53)'
+    Problem       = 'Die Firewall blockiert DNS eingehend:'
+    Erklaerung    = 'Clients erreichen den DNS-Server nur, wenn UDP und TCP Port 53 eingehend erlaubt sind. Geprueft wird nach Port, nicht nach Regelnamen. Die Reparatur legt eine Regel "NetSetup DNS" an.'
+    Stufe         = 'Bestaetigen'
+    Voraussetzung = { param($Z) $Z.Features['DNS'] -eq 'Installed' }
+    Test          = {
+        $zu = @()
+        if (-not (Test-NetFirewallPortOpen -Protokoll UDP -Port 53)) { $zu += 'UDP 53' }
+        if (-not (Test-NetFirewallPortOpen -Protokoll TCP -Port 53)) { $zu += 'TCP 53' }
+        if ($zu.Count -gt 0) { return (New-NetCheckResult FEHLER ($zu -join ', ') $zu) }
+        New-NetCheckResult OK 'UDP und TCP 53 erlaubt'
+    }
+    Reparatur     = {
+        param($Z, $E)
+        $null = $Z
+        foreach ($p in @($E.Daten)) { New-NetFirewallPortRule -Protokoll ($p.Split(' ')[0]) -Port 53 -Zweck 'DNS' }
+    }
+}
+# ----------------------------------------------------------------------
+# src/checks/N05-Firewall67.ps1
+# ----------------------------------------------------------------------
+# Pruefung N05: Firewall erlaubt DHCP (Port 67 UDP) eingehend.
+Register-NetCheck @{
+    Id            = 'N05'
+    Kategorie     = 'Netzwerk'
+    Titel         = 'Firewall DHCP (Port 67)'
+    Problem       = 'Die Firewall blockiert DHCP-Anfragen (UDP 67 eingehend).'
+    Erklaerung    = 'Ohne offenen UDP-Port 67 erreichen DHCP-Anfragen den Server nicht. Geprueft wird nach Port, nicht nach Regelnamen. Die Reparatur legt eine Regel "NetSetup DHCP" an.'
+    Stufe         = 'Bestaetigen'
+    Voraussetzung = { param($Z) $Z.Features['DHCP'] -eq 'Installed' }
+    Test          = {
+        if (Test-NetFirewallPortOpen -Protokoll UDP -Port 67) { New-NetCheckResult OK 'UDP 67 erlaubt' }
+        else { New-NetCheckResult FEHLER '' }
+    }
+    Reparatur     = { New-NetFirewallPortRule -Protokoll UDP -Port 67 -Zweck 'DHCP' }
+}
+# ----------------------------------------------------------------------
+# src/checks/N06-Weiterleitung.ps1
+# ----------------------------------------------------------------------
+# Pruefung N06: Die DNS-Weiterleitungen antworten.
+Register-NetCheck @{
+    Id            = 'N06'
+    Kategorie     = 'Netzwerk'
+    Titel         = 'DNS-Weiterleitungen'
+    Problem       = 'Keine Weiterleitung antwortet:'
+    Erklaerung    = 'Ohne erreichbare Weiterleitung koennen Clients keine Internet-Namen aufloesen. Ohne Internetzugang ist das normal. Die Reparatur bietet andere Weiterleitungen an (Quad9, Cloudflare, Router).'
+    Stufe         = 'Bestaetigen'
+    Interaktiv    = $true
+    Voraussetzung = { param($Z) $Z.Dns.Verfuegbar -and @($Z.Dns.Weiterleitungen).Count -gt 0 }
+    Test          = {
+        param($Z)
+        $ok = @($Z.Dns.Weiterleitungen | Where-Object { Test-NetDnsForwarder -Server $_ })
+        if ($ok.Count -gt 0) { return (New-NetCheckResult OK (($ok -join ', ') + ' antworten')) }
+        New-NetCheckResult WARN ($Z.Dns.Weiterleitungen -join ', ')
+    }
+    Reparatur     = { Set-NetDnsForwarder }
+}
+# ----------------------------------------------------------------------
+# src/checks/O01-RolleFehlt.ps1
+# ----------------------------------------------------------------------
+# Pruefung O01: Ein Domaenencontroller ohne DNS-Rolle.
+Register-NetCheck @{
+    Id            = 'O01'
+    Kategorie     = 'Rollen'
+    Titel         = 'DNS-Rolle auf dem DC'
+    Problem       = 'Dieser Domaenencontroller hat keine DNS-Server-Rolle.'
+    Erklaerung    = 'Das AD braucht DNS. Ueblich ist DNS auf jedem DC (AD-integrierte Zonen). Die Reparatur installiert die Rolle aus dem lokalen Windows.'
+    Stufe         = 'Bestaetigen'
+    Interaktiv    = $true
+    Voraussetzung = { param($Z) $Z.System.IstDC }
+    Test          = {
+        param($Z)
+        if ($Z.Features['DNS'] -eq 'Installed') { New-NetCheckResult OK 'DNS installiert' }
+        else { New-NetCheckResult FEHLER ('(Status: ' + (ConvertTo-NetFeatureText -Status $Z.Features['DNS']) + ')') }
+    }
+    Reparatur     = { Install-NetDnsRole }
+}
+# ----------------------------------------------------------------------
+# src/checks/O02-RolleOhneTools.ps1
+# ----------------------------------------------------------------------
+# Pruefung O02: Rolle installiert, aber Verwaltungstools fehlen.
+Register-NetCheck @{
+    Id         = 'O02'
+    Kategorie  = 'Rollen'
+    Titel      = 'Verwaltungstools'
+    Problem    = 'Eine Rolle ist ohne Verwaltungstools installiert:'
+    Erklaerung = 'Ohne Verwaltungstools fehlen die PowerShell-Befehle (z. B. Get-DhcpServerv4Scope), NetSetup kann die Rolle dann nicht verwalten. Die Reparatur installiert die Tools aus dem lokalen Windows.'
+    Stufe      = 'Bestaetigen'
+    Test       = {
+        param($Z)
+        $fehlend = @()
+        if ($Z.Features['DNS'] -eq 'Installed' -and $Z.Features['RSAT-DNS-Server'] -ne 'Installed') { $fehlend += 'RSAT-DNS-Server' }
+        if ($Z.Features['DHCP'] -eq 'Installed' -and $Z.Features['RSAT-DHCP'] -ne 'Installed') { $fehlend += 'RSAT-DHCP' }
+        if ($Z.Features['AD-Domain-Services'] -eq 'Installed' -and $Z.Features['RSAT-AD-PowerShell'] -ne 'Installed') { $fehlend += 'RSAT-AD-PowerShell' }
+        if ($fehlend.Count -gt 0) { return (New-NetCheckResult WARN ($fehlend -join ', ') $fehlend) }
+        New-NetCheckResult OK 'vollstaendig'
+    }
+    Reparatur  = {
+        param($Z, $E)
+        $null = $Z
+        $erg = Install-WindowsFeature -Name $E.Daten
+        if ($erg -and $erg.PSObject.Properties['Success'] -and -not $erg.Success) { throw 'Die Installation der Tools ist fehlgeschlagen.' }
+    }
+}
+# ----------------------------------------------------------------------
+# src/checks/O03-AdNichtHeraufgestuft.ps1
+# ----------------------------------------------------------------------
+# Pruefung O03: Rolle AD-Domain-Services installiert, Server ist aber kein DC.
+Register-NetCheck @{
+    Id            = 'O03'
+    Kategorie     = 'Rollen'
+    Titel         = 'AD DS ohne Heraufstufung'
+    Problem       = 'Die Rolle AD-Domain-Services ist installiert, der Server ist aber kein Domaenencontroller.'
+    Erklaerung    = 'Entweder wurde die Heraufstufung nie gemacht oder ist fehlgeschlagen. Die Reparatur bietet an: jetzt heraufstufen (AD-Assistent) oder die ungewollte Rolle entfernen (gefaehrlich, mit Backup und Neustart).'
+    Stufe         = 'Gefaehrlich'
+    Interaktiv    = $true
+    Voraussetzung = { param($Z) -not $Z.System.IstDC }
+    Test          = {
+        param($Z)
+        if ($Z.Features['AD-Domain-Services'] -eq 'Installed') { New-NetCheckResult WARN '' }
+        else { New-NetCheckResult OK 'nicht installiert' }
+    }
+    Reparatur     = {
+        $wahl = Read-NetChoice -Frage 'Was soll passieren?' -Optionen @('Jetzt heraufstufen (AD-Assistent)', 'Rolle entfernen (gefaehrlich)', 'Nichts tun') -Vorschlag 3
+        if ($wahl -eq 0) { Start-NetAdSetup }
+        elseif ($wahl -eq 1) {
+            $r = Invoke-NetChange -Titel 'Rolle AD-Domain-Services entfernen' -Stufe Gefaehrlich -Vorher 'AD-Domain-Services installiert (kein DC)' -Nachher 'Rolle entfernt (Neustart noetig)' -BackupBereich @('Config') -Aktion {
+                Uninstall-WindowsFeature -Name AD-Domain-Services -IncludeManagementTools | Out-Null
+            }
+            if ($r.Erfolg -and -not $r.Probelauf) { Request-NetRestart -Grund 'Entfernen der Rolle AD-Domain-Services' }
+        }
+    }
+}
+# ----------------------------------------------------------------------
+# src/checks/O04-RolleUngenutzt.ps1
+# ----------------------------------------------------------------------
+# Pruefung O04: DHCP-Rolle installiert, aber ungenutzt (kein Scope) - evtl. auf dem falschen Server.
+Register-NetCheck @{
+    Id            = 'O04'
+    Kategorie     = 'Rollen'
+    Titel         = 'Ungenutzte DHCP-Rolle'
+    Problem       = 'Die DHCP-Rolle ist installiert, hat aber keinen Scope.'
+    Erklaerung    = 'Vielleicht wurde DHCP auf dem falschen Server installiert. Die Reparatur bietet an: Scope anlegen (DHCP-Assistent) oder die Rolle entfernen (gefaehrlich, mit Backup).'
+    Stufe         = 'Gefaehrlich'
+    Interaktiv    = $true
+    Voraussetzung = { param($Z) $Z.Dhcp.Verfuegbar }
+    Test          = {
+        param($Z)
+        if (@($Z.Dhcp.Scopes).Count -eq 0) { New-NetCheckResult WARN '' }
+        else { New-NetCheckResult OK ('{0} Scope(s)' -f @($Z.Dhcp.Scopes).Count) }
+    }
+    Reparatur     = {
+        $wahl = Read-NetChoice -Frage 'Was soll passieren?' -Optionen @('DHCP hier einrichten (Assistent)', 'DHCP-Rolle entfernen (gefaehrlich)', 'Nichts tun') -Vorschlag 3
+        if ($wahl -eq 0) { Start-NetDhcpSetup }
+        elseif ($wahl -eq 1) {
+            Invoke-NetChange -Titel 'DHCP-Rolle entfernen' -Stufe Gefaehrlich -Vorher 'DHCP installiert (ohne Scope)' -Nachher 'DHCP-Rolle entfernt' -BackupBereich @('Dhcp', 'Config') -Aktion {
+                Uninstall-WindowsFeature -Name DHCP -IncludeManagementTools | Out-Null
+            } | Out-Null
+        }
+    }
+}
+# ----------------------------------------------------------------------
+# src/checks/O05-Neustart.ps1
+# ----------------------------------------------------------------------
+# Pruefung O05: Ein Neustart steht aus.
+Register-NetCheck @{
+    Id         = 'O05'
+    Kategorie  = 'Rollen'
+    Titel      = 'Ausstehender Neustart'
+    Problem    = 'Ein Neustart steht aus:'
+    Erklaerung = 'Installationen oder Umbenennungen werden erst nach dem Neustart wirksam. Vor AD-Aenderungen unbedingt neu starten.'
+    Stufe      = 'Bestaetigen'
+    Interaktiv = $true
+    Test       = {
+        param($Z)
+        if ($Z.Neustart.Ausstehend) { New-NetCheckResult WARN ($Z.Neustart.Gruende -join ', ') }
+        else { New-NetCheckResult OK 'kein Neustart ausstehend' }
+    }
+    Reparatur  = { param($Z, $E) $null = $Z; Request-NetRestart -Grund ('ausstehender Neustart: ' + $E.Detail) }
+}
+# ----------------------------------------------------------------------
+# src/checks/O06-DienstGestoppt.ps1
+# ----------------------------------------------------------------------
+# Pruefung O06: Dienst einer installierten Rolle ist gestoppt (DNS, DHCP, Zeitdienst).
+Register-NetCheck @{
+    Id         = 'O06'
+    Kategorie  = 'Rollen'
+    Titel      = 'Gestoppte Dienste'
+    Problem    = 'Diese Dienste laufen nicht:'
+    Erklaerung = 'Ein gestoppter Dienst ist harmlos zu starten. Bei Stufe Automatisch startet der Doktor ihn sofort (abschaltbar in den Einstellungen).'
+    Stufe      = 'Automatisch'
+    Test       = {
+        param($Z)
+        $namen = @('W32Time')
+        if ($Z.Features['DNS'] -eq 'Installed') { $namen += 'DNS' }
+        if ($Z.Features['DHCP'] -eq 'Installed') { $namen += 'DHCPServer' }
+        $gestoppt = @($namen | Where-Object { $Z.Dienste[$_] -and $Z.Dienste[$_].Vorhanden -and $Z.Dienste[$_].Status -ne 'Running' -and $Z.Dienste[$_].StartTyp -ne 'Disabled' })
+        if ($gestoppt.Count -gt 0) { return (New-NetCheckResult FEHLER ($gestoppt -join ', ') $gestoppt) }
+        New-NetCheckResult OK (($namen -join ', ') + ' laufen')
+    }
+    Reparatur  = { param($Z, $E) $null = $Z; foreach ($d in @($E.Daten)) { Start-Service -Name $d } }
+}
+# ----------------------------------------------------------------------
+# src/checks/O07-DienstDeaktiviert.ps1
+# ----------------------------------------------------------------------
+# Pruefung O07: Dienst einer installierten Rolle ist deaktiviert.
+Register-NetCheck @{
+    Id         = 'O07'
+    Kategorie  = 'Rollen'
+    Titel      = 'Deaktivierte Dienste'
+    Problem    = 'Diese Dienste sind deaktiviert:'
+    Erklaerung = 'Ein deaktivierter Dienst startet nie. Die Reparatur stellt den Starttyp auf Automatisch und startet ihn.'
+    Stufe      = 'Bestaetigen'
+    Test       = {
+        param($Z)
+        $namen = @('W32Time')
+        if ($Z.Features['DNS'] -eq 'Installed') { $namen += 'DNS' }
+        if ($Z.Features['DHCP'] -eq 'Installed') { $namen += 'DHCPServer' }
+        if ($Z.System.IstDC) { $namen += @('NTDS', 'Netlogon') }
+        $aus = @($namen | Where-Object { $Z.Dienste[$_] -and $Z.Dienste[$_].Vorhanden -and $Z.Dienste[$_].StartTyp -eq 'Disabled' })
+        if ($aus.Count -gt 0) { return (New-NetCheckResult FEHLER ($aus -join ', ') $aus) }
+        New-NetCheckResult OK 'keiner deaktiviert'
+    }
+    Reparatur  = { param($Z, $E) $null = $Z; foreach ($d in @($E.Daten)) { Set-Service -Name $d -StartupType Automatic; Start-Service -Name $d } }
+}
+# ----------------------------------------------------------------------
+# src/checks/O08-DhcpNachkonfiguration.ps1
+# ----------------------------------------------------------------------
+# Pruefung O08: DHCP-Nachkonfiguration fehlt.
+Register-NetCheck @{
+    Id            = 'O08'
+    Kategorie     = 'Rollen'
+    Titel         = 'DHCP-Nachkonfiguration'
+    Problem       = 'Die DHCP-Nachkonfiguration fehlt (Server-Manager meldet "Konfiguration erforderlich").'
+    Erklaerung    = 'Nach der Installation muessen die Sicherheitsgruppen angelegt und der Abschluss im Server-Manager vermerkt werden (ConfigurationState = 2).'
+    Stufe         = 'Bestaetigen'
+    Interaktiv    = $true
+    Voraussetzung = { param($Z) $Z.Features['DHCP'] -eq 'Installed' }
+    Test          = {
+        param($Z)
+        if ($Z.Dhcp.Nachkonfiguriert) { New-NetCheckResult OK 'erledigt' }
+        else { New-NetCheckResult WARN '' }
+    }
+    Reparatur     = { Complete-NetDhcpPostInstall }
+}
+# ----------------------------------------------------------------------
+# src/checks/O09-DhcpDatenbank.ps1
+# ----------------------------------------------------------------------
+# Pruefung O09: DHCP-Datenbank fehlt oder der Dienst kann sie nicht lesen.
+Register-NetCheck @{
+    Id            = 'O09'
+    Kategorie     = 'Rollen'
+    Titel         = 'DHCP-Datenbank'
+    Problem       = 'Die DHCP-Datenbank fehlt oder ist beschaedigt.'
+    Erklaerung    = 'Ohne lesbare Datenbank startet der DHCP-Dienst nicht. Die Reparatur stellt die Datenbank aus einem Backup wieder her (gefaehrlich: aktuelle Leases werden ersetzt).'
+    Stufe         = 'Gefaehrlich'
+    Interaktiv    = $true
+    Voraussetzung = { param($Z) $Z.Features['DHCP'] -eq 'Installed' -and $Z.Dienste['DHCPServer'] -and $Z.Dienste['DHCPServer'].Vorhanden }
+    Test          = {
+        param($Z)
+        $windows = $env:SystemRoot
+        if (-not $windows) { $windows = 'C:\Windows' }
+        $datei = $windows.TrimEnd('\') + '\System32\dhcp\dhcp.mdb'
+        if (-not (Test-Path -Path $datei)) { return (New-NetCheckResult FEHLER ('(' + $datei + ' fehlt)')) }
+        if ($Z.Dienste['DHCPServer'].Status -ne 'Running' -and -not $Z.Dhcp.Verfuegbar) { return (New-NetCheckResult WARN '(Dienst laeuft nicht - Datenbank evtl. beschaedigt, zuerst O06 pruefen)') }
+        New-NetCheckResult OK 'vorhanden'
+    }
+    Reparatur     = {
+        if (Test-NetCommand -Name 'Restore-NetDhcpBackup') { Restore-NetDhcpBackup }
+        else { Write-Log -Level Warn -Message 'Wiederherstellen ist im Menue Backup verfuegbar.' }
+    }
+}
+# ----------------------------------------------------------------------
+# src/checks/R01-Administrator.ps1
+# ----------------------------------------------------------------------
+# Pruefung R01: NetSetup laeuft mit Administratorrechten.
+Register-NetCheck @{
+    Id         = 'R01'
+    Kategorie  = 'Rechte'
+    Titel      = 'Administratorrechte'
+    Problem    = 'NetSetup laeuft ohne Administratorrechte.'
+    Erklaerung = 'Fast alle Aenderungen brauchen Administratorrechte. PowerShell bzw. ISE mit rechter Maustaste "Als Administrator ausfuehren" starten.'
+    Stufe      = 'Bestaetigen'
+    Test       = {
+        param($Z)
+        if ($Z.System.IstAdmin) { New-NetCheckResult OK 'als Administrator gestartet' }
+        else { New-NetCheckResult FEHLER '' }
+    }
+}
+# ----------------------------------------------------------------------
+# src/checks/R02-Domaenenkonto.ps1
+# ----------------------------------------------------------------------
+# Pruefung R02: In einer Domaene mit einem Domaenenkonto angemeldet.
+Register-NetCheck @{
+    Id            = 'R02'
+    Kategorie     = 'Rechte'
+    Titel         = 'Domaenenkonto'
+    Problem       = 'Angemeldet mit einem lokalen Konto.'
+    Erklaerung    = 'Fuer AD-, DNS- und DHCP-Aenderungen in der Domaene (z. B. Autorisierung, Dienstkonto) wird ein Domaenenkonto mit passenden Rechten gebraucht. Abmelden und als DOMAENE\Administrator anmelden.'
+    Stufe         = 'Bestaetigen'
+    Voraussetzung = { param($Z) $Z.System.IstMitglied }
+    Test          = {
+        $konto = Get-NetCurrentAccount
+        if ($konto.IstLokal) { New-NetCheckResult WARN ('(' + $konto.Name + ')') }
+        else { New-NetCheckResult OK $konto.Name }
+    }
+}
+# ----------------------------------------------------------------------
+# src/checks/R03-OrganisationsAdmin.ps1
+# ----------------------------------------------------------------------
+# Pruefung R03: Rechte fuer die DHCP-Autorisierung (Organisations-Admins).
+Register-NetCheck @{
+    Id            = 'R03'
+    Kategorie     = 'Rechte'
+    Titel         = 'Rechte fuer DHCP-Autorisierung'
+    Problem       = 'Der DHCP-Server ist nicht autorisiert und das Konto ist nicht in der Gruppe Organisations-Admins.'
+    Erklaerung    = 'Die Autorisierung im AD duerfen nur Organisations-Admins (Enterprise Admins) bzw. Konten mit delegiertem Recht. Mit einem solchen Konto anmelden oder einen Organisations-Admin bitten.'
+    Stufe         = 'Bestaetigen'
+    Voraussetzung = { param($Z) $Z.Dhcp.Verfuegbar -and $Z.Dhcp.InDomaene -and -not $Z.Dhcp.Autorisiert }
+    Test          = {
+        if (Test-NetEnterpriseAdmin) { New-NetCheckResult OK 'Konto ist Organisations-Admin' }
+        else { New-NetCheckResult WARN '' }
+    }
+}
+# ----------------------------------------------------------------------
+# src/checks/R04-Zeitabweichung.ps1
+# ----------------------------------------------------------------------
+# Pruefung R04: Zeitabweichung zum PDC bzw. zur Domaene.
+Register-NetCheck @{
+    Id            = 'R04'
+    Kategorie     = 'Rechte'
+    Titel         = 'Zeitabweichung zur Domaene'
+    Problem       = 'Die Uhr weicht vom PDC-Emulator ab.'
+    Erklaerung    = 'Ab 5 Minuten Abweichung schlaegt die Anmeldung (Kerberos) fehl. Die Reparatur synchronisiert die Uhr mit der Domaenenhierarchie (w32tm /resync).'
+    Stufe         = 'Automatisch'
+    Voraussetzung = { param($Z) ($Z.System.IstMitglied -or ($Z.System.IstDC -and -not $Z.System.IstPdc)) -and $Z.AD.Pdc }
+    Test          = {
+        param($Z)
+        $abw = Get-NetTimeOffset -Server $Z.AD.Pdc
+        if ($null -eq $abw) { return (New-NetCheckResult WARN ('PDC {0} antwortet nicht auf UDP 123.' -f $Z.AD.Pdc)) }
+        $betrag = [Math]::Abs([double]$abw)
+        if ($betrag -gt 300) { return (New-NetCheckResult FEHLER ('{0:N0} Sekunden.' -f $abw) $abw) }
+        if ($betrag -gt 60) { return (New-NetCheckResult WARN ('{0:N0} Sekunden.' -f $abw) $abw) }
+        New-NetCheckResult OK ('{0} Sekunden' -f $abw) $abw
+    }
+    Reparatur     = {
+        Invoke-NetW32tm -Argumente @('/config', '/syncfromflags:domhier', '/update')
+        Invoke-NetW32tm -Argumente @('/resync', '/force')
+    }
+}
+# ----------------------------------------------------------------------
+# src/checks/V01-ZoneFehlt.ps1
+# ----------------------------------------------------------------------
+# Pruefung V01: Die Zone der Domaene bzw. der Clients existiert.
+Register-NetCheck @{
+    Id            = 'V01'
+    Kategorie     = 'DNS'
+    Titel         = 'Forward-Zone'
+    Problem       = 'Die Zone fehlt:'
+    Erklaerung    = 'Ohne Zone der Domaene (bzw. der Client-Domaene aus Option 015) kann niemand eingetragen und gefunden werden. Die Reparatur legt die Zone an.'
+    Stufe         = 'Bestaetigen'
+    Interaktiv    = $true
+    Voraussetzung = { param($Z) $Z.Dns.Verfuegbar }
+    Test          = {
+        param($Z)
+        $soll = @()
+        $d = Get-NetDomainName -Zustand $Z
+        if ($d -and $Z.System.IstDC) { $soll += $d }
+        foreach ($s in @($Z.Dhcp.Scopes)) { if ($s.Optionen.ContainsKey('15')) { $soll += @($s.Optionen['15']) } }
+        $soll = @($soll | Where-Object { $_ } | ForEach-Object { ([string]$_).ToLower() } | Select-Object -Unique)
+        $vorhanden = @($Z.Dns.Zonen | ForEach-Object { $_.Name })
+        $fehlend = @($soll | Where-Object { $vorhanden -notcontains $_ })
+        if ($fehlend.Count -gt 0) { return (New-NetCheckResult FEHLER ($fehlend -join ', ') $fehlend) }
+        if (@($Z.Dns.Zonen | Where-Object { -not $_.Reverse }).Count -eq 0) { return (New-NetCheckResult WARN 'keine Forward-Zone vorhanden' @()) }
+        New-NetCheckResult OK (($soll + @()) -join ', ')
+    }
+    Reparatur     = {
+        param($Z, $E)
+        $null = $Z
+        if (@($E.Daten).Count -eq 0) { New-NetDnsForwardZone; return }
+        foreach ($zone in @($E.Daten)) { New-NetDnsZone -Name $zone | Out-Null }
+    }
+}
+# ----------------------------------------------------------------------
+# src/checks/V02-ReverseZoneFehlt.ps1
+# ----------------------------------------------------------------------
+# Pruefung V02: Reverse-Zonen fuer das Server-Netz und alle Scopes.
+Register-NetCheck @{
+    Id            = 'V02'
+    Kategorie     = 'DNS'
+    Titel         = 'Reverse-Zonen'
+    Problem       = 'Reverse-Zonen fehlen:'
+    Erklaerung    = 'Ohne Reverse-Zone gibt es keine PTR-Eintraege (Adresse -> Name). Viele Programme (Protokolle, Ueberwachung, Mailserver) brauchen das. Die Reparatur schlaegt die fehlenden Zonen vor.'
+    Stufe         = 'Bestaetigen'
+    Interaktiv    = $true
+    Voraussetzung = { param($Z) $Z.Dns.Verfuegbar }
+    Test          = {
+        param($Z)
+        $fehlend = @(Get-NetMissingReverseZone -Zustand $Z)
+        if ($fehlend.Count -gt 0) { return (New-NetCheckResult WARN (($fehlend | ForEach-Object { '{0} ({1})' -f $_.Zone, $_.Netz }) -join ', ')) }
+        New-NetCheckResult OK 'fuer alle Netze vorhanden'
+    }
+    Reparatur     = { Add-NetMissingReverseZone }
+}
+# ----------------------------------------------------------------------
+# src/checks/V03-DynUpdatesAus.ps1
+# ----------------------------------------------------------------------
+# Pruefung V03: Dynamische Updates in den Zonen sind eingeschaltet.
+Register-NetCheck @{
+    Id            = 'V03'
+    Kategorie     = 'DNS'
+    Titel         = 'Dynamische Updates'
+    Problem       = 'In diesen Zonen sind dynamische Updates aus:'
+    Erklaerung    = 'Dann koennen sich weder Clients noch der DHCP-Server eintragen. Auf DCs ist "nur sicher" richtig, bei dateibasierten Zonen "sicher und unsicher".'
+    Stufe         = 'Bestaetigen'
+    Interaktiv    = $true
+    Voraussetzung = { param($Z) $Z.Dns.Verfuegbar -and @($Z.Dns.Zonen | Where-Object { $_.Typ -eq 'Primary' }).Count -gt 0 }
+    Test          = {
+        param($Z)
+        $aus = @($Z.Dns.Zonen | Where-Object { $_.Typ -eq 'Primary' -and $_.DynUpdate -eq 'None' -and $_.Name -notlike '*.ip6.arpa' } | ForEach-Object { $_.Name })
+        $unsicher = @($Z.Dns.Zonen | Where-Object { $_.AdIntegriert -and $_.DynUpdate -eq 'NonsecureAndSecure' } | ForEach-Object { $_.Name })
+        if ($aus.Count -gt 0) { return (New-NetCheckResult WARN ($aus -join ', ') $aus) }
+        if ($unsicher.Count -gt 0) { return (New-NetCheckResult WARN ('unsichere Updates erlaubt in: ' + ($unsicher -join ', ')) $unsicher) }
+        New-NetCheckResult OK 'eingeschaltet'
+    }
+    Reparatur     = {
+        param($Z, $E)
+        foreach ($zone in @($E.Daten)) {
+            $info = @($Z.Dns.Zonen | Where-Object { $_.Name -eq $zone }) | Select-Object -First 1
+            $wert = 'NonsecureAndSecure'
+            if ($info -and $info.AdIntegriert) { $wert = 'Secure' }
+            Set-NetDnsZoneUpdate -Zone $zone -Wert $wert | Out-Null
+        }
+    }
+}
+# ----------------------------------------------------------------------
+# src/checks/V04-DnsZugangsdaten.ps1
+# ----------------------------------------------------------------------
+# Pruefung V04: DNS-Zugangsdaten des DHCP-Servers gesetzt und gueltig.
+Register-NetCheck @{
+    Id            = 'V04'
+    Kategorie     = 'DNS'
+    Titel         = 'DNS-Zugangsdaten des DHCP-Servers'
+    Problem       = 'Die DNS-Zugangsdaten fehlen oder sind ungueltig:'
+    Erklaerung    = 'Laeuft DHCP auf einem DC ohne eigenes Dienstkonto, gehoeren alle Client-Eintraege dem DC (Sicherheitsrisiko, Aktualisierungsprobleme). Ein abgelaufenes Kennwort laesst alle Eintraege scheitern. Die Reparatur richtet das Dienstkonto ein bzw. setzt ein neues Kennwort.'
+    Stufe         = 'Bestaetigen'
+    Interaktiv    = $true
+    Voraussetzung = { param($Z) $Z.Dhcp.Verfuegbar -and ($Z.System.IstDC -or $Z.System.IstMitglied) }
+    Test          = {
+        param($Z)
+        $zd = $Z.Dhcp.DnsZugangsdaten
+        if (-not $zd.Gesetzt) {
+            if ($Z.System.IstDC) { return (New-NetCheckResult FEHLER 'DHCP laeuft auf einem DC ohne Zugangsdaten') }
+            return (New-NetCheckResult WARN 'keine Zugangsdaten gesetzt')
+        }
+        $konto = Get-NetDnsCredentialAccountState -Benutzer $zd.Benutzer
+        if ($konto -and $konto.Problem) { return (New-NetCheckResult FEHLER $konto.Problem) }
+        New-NetCheckResult OK ('{0}\{1}' -f $zd.Domaene, $zd.Benutzer)
+    }
+    Reparatur     = { New-NetDhcpDnsCredential }
+}
+# ----------------------------------------------------------------------
+# src/checks/V05-LeasesOhneDns.ps1
+# ----------------------------------------------------------------------
+# Pruefung V05: Alle aktiven Leases haben A- und PTR-Eintrag.
+Register-NetCheck @{
+    Id            = 'V05'
+    Kategorie     = 'DNS'
+    Titel         = 'Leases ohne DNS-Eintrag'
+    Problem       = 'Aktive Leases ohne vollstaendigen DNS-Eintrag:'
+    Erklaerung    = 'Clients ohne A- oder PTR-Eintrag sind per Name nicht erreichbar. Die Reparatur zeigt jede Lease mit Ursache und bietet das Nachtragen an; dauerhaft hilft der Assistent "DHCP + DNS verbinden".'
+    Stufe         = 'Bestaetigen'
+    Interaktiv    = $true
+    Voraussetzung = { param($Z) $Z.Dhcp.Verfuegbar -and $Z.Dns.Verfuegbar -and @($Z.Dhcp.Scopes).Count -gt 0 }
+    Test          = {
+        param($Z)
+        $liste = @(Get-NetLeaseDnsCheck -Zustand $Z)
+        $fehlend = @($liste | Where-Object { $_.Name -and -not ($_.A -and $_.PTR) })
+        if ($fehlend.Count -gt 0) { return (New-NetCheckResult WARN ('{0} von {1}' -f $fehlend.Count, $liste.Count)) }
+        New-NetCheckResult OK ('{0} aktive Lease(s) vollstaendig' -f $liste.Count)
+    }
+    Reparatur     = { Show-NetLeaseDnsCheck | Out-Null }
+}
+# ----------------------------------------------------------------------
+# src/checks/V06-VeralteteEintraege.ps1
+# ----------------------------------------------------------------------
+# Pruefung V06: Veraltete dynamische Eintraege bei ausgeschaltetem Aufraeumen.
+Register-NetCheck @{
+    Id            = 'V06'
+    Kategorie     = 'DNS'
+    Titel         = 'Veraltete Eintraege'
+    Problem       = 'Veraltete dynamische Eintraege, Aufraeumen ist aus:'
+    Erklaerung    = 'Alte Eintraege zeigen auf Adressen, die laengst anderen Geraeten gehoeren. Das Aufraeumen (Aging/Scavenging, Vorschlag 7 + 7 Tage) entfernt sie automatisch.'
+    Stufe         = 'Bestaetigen'
+    Interaktiv    = $true
+    Voraussetzung = { param($Z) $Z.Dns.Verfuegbar }
+    Test          = {
+        param($Z)
+        $an = $Z.Dns.Scavenging -and $Z.Dns.Scavenging.Aktiv
+        $alt = @(Get-NetStaleDnsRecord -NoRefreshTage 7 -RefreshTage 7)
+        if ($alt.Count -gt 0 -and -not $an) { return (New-NetCheckResult WARN ('{0} Eintraege aelter als 14 Tage' -f $alt.Count)) }
+        if (-not $an) { return (New-NetCheckResult WARN 'Aufraeumen ist aus (noch keine veralteten Eintraege)') }
+        New-NetCheckResult OK ('Aufraeumen an, {0} Eintraege stehen zur Loeschung an' -f $alt.Count)
+    }
+    Reparatur     = { Set-NetDnsScavenging | Out-Null }
+}
+# ----------------------------------------------------------------------
+# src/checks/V07-DoppelteEintraege.ps1
+# ----------------------------------------------------------------------
+# Pruefung V07: Doppelte DNS-Eintraege (Name mit mehreren IPs, IP unter mehreren Namen).
+Register-NetCheck @{
+    Id            = 'V07'
+    Kategorie     = 'DNS'
+    Titel         = 'Doppelte Eintraege'
+    Problem       = 'Doppelte dynamische Eintraege:'
+    Erklaerung    = 'Doppelte Eintraege fuehren dazu, dass ein Name mal hier, mal dort landet. Ursache sind meist fehlendes Aufraeumen oder Geraete, die Namen bzw. Adressen wechseln. Abhilfe: Aufraeumen einschalten, Namensschutz im DHCP, falsche Eintraege im Menue DNS -> Eintraege loeschen.'
+    Stufe         = 'Bestaetigen'
+    Voraussetzung = { param($Z) $Z.Dns.Verfuegbar }
+    Test          = {
+        param($Z)
+        $zonen = @($Z.Dns.Zonen | Where-Object { -not $_.Reverse -and $_.Typ -eq 'Primary' -and $_.Name -notlike '_msdcs.*' } | ForEach-Object { $_.Name })
+        $doppelt = @(Get-NetDuplicateDnsRecord -Zonen $zonen)
+        if ($doppelt.Count -gt 0) { return (New-NetCheckResult WARN (($doppelt | Select-Object -First 5 | ForEach-Object { '{0}: {1}' -f $_.Wert, $_.Liste }) -join '; ')) }
+        New-NetCheckResult OK 'keine'
+    }
+}
+# ----------------------------------------------------------------------
+# src/checks/V08-DhcpDnsEinstellung.ps1
+# ----------------------------------------------------------------------
+# Pruefung V08: Der DHCP-Server traegt alle Clients ein und raeumt beim Lease-Ablauf auf.
+Register-NetCheck @{
+    Id            = 'V08'
+    Kategorie     = 'DNS'
+    Titel         = 'DHCP traegt in DNS ein'
+    Problem       = 'Die DHCP-DNS-Einstellung ist unvollstaendig:'
+    Erklaerung    = 'Damit jeder Client automatisch A- und PTR-Eintrag bekommt, muss DHCP "immer" eintragen, auch fuer aeltere Clients, und bei Lease-Ablauf loeschen - fuer den Server und jeden Scope.'
+    Stufe         = 'Bestaetigen'
+    Interaktiv    = $true
+    Voraussetzung = { param($Z) $Z.Dhcp.Verfuegbar }
+    Test          = {
+        param($Z)
+        $falsch = @()
+        if (-not (Test-NetDhcpDnsSettingOk -Einstellung $Z.Dhcp.DnsEinstellung)) { $falsch += 'Server' }
+        foreach ($s in @($Z.Dhcp.Scopes)) { if ($s.DnsEinstellung -and -not (Test-NetDhcpDnsSettingOk -Einstellung $s.DnsEinstellung)) { $falsch += ('Scope ' + $s.ScopeId) } }
+        if ($falsch.Count -gt 0) { return (New-NetCheckResult WARN ($falsch -join ', ')) }
+        New-NetCheckResult OK 'Always, Loeschen bei Ablauf, aeltere Clients'
+    }
+    Reparatur     = { Set-NetDhcpDnsSetting | Out-Null }
 }
 # ----------------------------------------------------------------------
 # src/ui/Ersteinrichtung.ps1

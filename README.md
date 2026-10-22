@@ -24,7 +24,8 @@ Im Aufbau. Fertig: Grundgerüst mit Hauptmenü, Hilfe, Glossar, Logging, Probela
 Einstellungen; Bestandsaufnahme mit Statusübersicht beim Start; Ersteinrichtungs-Assistent;
 Active Directory (neue Gesamtstruktur, zusätzlicher DC, Beitritt) mit Fortsetzung nach Neustart;
 DNS (Zonen, Einträge, Weiterleitungen, Aufräumen, Abhör-Adressen);
-DHCP (Scopes, Optionen, Reservierungen, Leases, Failover); DHCP trägt automatisch in DNS ein.
+DHCP (Scopes, Optionen, Reservierungen, Leases, Failover); DHCP trägt automatisch in DNS ein;
+Doktor mit Prüfkatalog und Reparatur, `-Task Health` für geplante Prüfungen.
 Die übrigen Menüpunkte sind als „kommt noch“ markiert.
 Details siehe [CHANGELOG.md](CHANGELOG.md).
 
