@@ -1,0 +1,27 @@
+# Laufzeitdaten von NetSetup (nie committen)
+NetSetup-Daten/
+*.log
+Logs/
+Backups/
+Berichte/
+Rueckgaengig/
+
+# Geheimnisse
+.env
+*.env
+*.pfx
+*.key
+netsetup.json
+!config/netsetup.example.json
+
+# Testergebnisse
+testResults.xml
+coverage.xml
+TestResults/
+
+# Editor und System
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+.DS_Store

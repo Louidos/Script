@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  pruefen:
+    name: Pruefen (Windows PowerShell 5.1)
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Werkzeuge bereitstellen (nur CI, nie im Script)
+        run: |
+          $PSVersionTable.PSVersion.ToString()
+          Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force -Scope CurrentUser | Out-Null
+          Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
+          if (-not (Get-Module -ListAvailable -Name Pester | Where-Object { $_.Version -ge [version]'5.5.0' })) {
+              Install-Module -Name Pester -MinimumVersion 5.5.0 -Force -SkipPublisherCheck -Scope CurrentUser
+          }
+          if (-not (Get-Module -ListAvailable -Name PSScriptAnalyzer)) {
+              Install-Module -Name PSScriptAnalyzer -Force -Scope CurrentUser
+          }
+
+      - name: Lint (PSScriptAnalyzer inkl. PSUseCompatibleSyntax 5.1)
+        run: |
+          $ziele = @('src', 'scripts') | Where-Object { Get-ChildItem -Path $_ -Recurse -Filter *.ps1 -ErrorAction SilentlyContinue }
+          $befunde = @()
+          foreach ($ziel in $ziele) {
+              $befunde += Invoke-ScriptAnalyzer -Path $ziel -Recurse -Settings scripts/PSScriptAnalyzerSettings.psd1
+          }
+          if ($befunde.Count -gt 0) {
+              $befunde | Format-Table -AutoSize -Property Severity, RuleName, ScriptName, Line, Message | Out-String -Width 400 | Write-Host
+              Write-Host "$($befunde.Count) Befund(e) von PSScriptAnalyzer."
+              exit 1
+          }
+          Write-Host 'Keine Befunde.'
+
+      - name: Tests (Pester)
+        run: |
+          if (-not (Get-ChildItem -Path tests -Filter *.Tests.ps1 -Recurse)) { Write-Host 'Noch keine Tests vorhanden.'; exit 0 }
+          Import-Module Pester -MinimumVersion 5.5.0
+          Invoke-Pester -Path tests -CI
