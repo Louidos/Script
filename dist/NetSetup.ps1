@@ -1,5 +1,5 @@
 <#
-    NetSetup 0.0.0 (Build 2026-10-22 21:29)
+    NetSetup 0.0.0 (Build 2026-10-22 21:37)
     AD, DNS und DHCP auf Windows Server einrichten, verwalten und reparieren.
 #
     So starten (PowerShell oder PowerShell ISE als Administrator):
@@ -14,7 +14,7 @@
 #>
 $NetSetupCode = {
 $script:NetSetupVersion = '0.0.0'
-$script:NetSetupBuildDatum = '2026-10-22 21:29'
+$script:NetSetupBuildDatum = '2026-10-22 21:37'
 # ----------------------------------------------------------------------
 # src/core/Zustand.ps1
 # ----------------------------------------------------------------------
@@ -3775,6 +3775,1198 @@ function Show-NetAdMenu {
         @{ Text = 'Unterbrochene Einrichtung fortsetzen'; Aktion = 'Invoke-NetResumeCheck'; Hilfe = 'Falls eine Einrichtung wegen eines Neustarts unterbrochen wurde und nicht automatisch weiterlief: hier fortsetzen oder verwerfen.' }
     )
     Show-NetMenu -Titel 'Active Directory' -Eintraege $eintraege
+}
+# ----------------------------------------------------------------------
+# src/dns/DnsBasis.ps1
+# ----------------------------------------------------------------------
+# DNS-Grundlagen: Rolle pruefen/installieren, Zonen auswaehlen, Eintraege lesen und vergleichen.
+#
+function Install-NetDnsRole {
+    <#
+    .SYNOPSIS
+        Installiert die DNS-Server-Rolle und/oder die Verwaltungstools, falls sie fehlen.
+    #>
+    $f = Get-NetFeatureState
+    if ($f['DNS'] -eq 'Installed' -and $f['RSAT-DNS-Server'] -eq 'Installed' -and (Test-NetCommand -Name 'Get-DnsServerZone')) {
+        Write-Log -Level OK -Message 'DNS-Server-Rolle und Verwaltungstools sind installiert.'
+        return $true
+    }
+    $namen = @()
+    if ($f['DNS'] -ne 'Installed') { $namen += 'DNS' }
+    if ($f['RSAT-DNS-Server'] -ne 'Installed') { $namen += 'RSAT-DNS-Server' }
+    if ($namen.Count -eq 0) { $namen = @('RSAT-DNS-Server') }
+    $r = Invoke-NetChange -Titel ('Windows-Funktion(en) installieren: ' + ($namen -join ', ')) -Stufe Bestaetigen `
+        -Vorher @{ DNS = (ConvertTo-NetFeatureText -Status $f['DNS']); 'RSAT-DNS-Server' = (ConvertTo-NetFeatureText -Status $f['RSAT-DNS-Server']) } `
+        -Nachher @{ DNS = 'installiert'; 'RSAT-DNS-Server' = 'installiert' } -Aktion {
+        $erg = Install-WindowsFeature -Name $namen -IncludeManagementTools
+        if ($erg -and $erg.PSObject.Properties['Success'] -and -not $erg.Success) { throw 'Die Installation ist fehlgeschlagen.' }
+        Import-Module DnsServer -ErrorAction SilentlyContinue
+    } -Rueckgaengig @{ Befehl = 'Uninstall-WindowsFeature'; Parameter = @{ Name = $namen } }
+    return [bool]($r.Erfolg -and -not $r.Probelauf)
+}
+#
+function Test-NetDnsReady {
+    <#
+    .SYNOPSIS
+        Prueft, ob DNS verwaltet werden kann. Bietet sonst die Installation an.
+    #>
+    param([switch]$Still)
+    $dienst = Get-NetSafe -Beschreibung 'Dienst DNS' -Abfrage { Get-Service -Name DNS }
+    if ((Test-NetCommand -Name 'Get-DnsServerZone') -and $dienst) {
+        if ([string]$dienst.Status -ne 'Running') {
+            Write-Log -Level Warn -Message 'Der DNS-Dienst laeuft nicht.'
+            if (-not $Still -and (Read-NetYesNo -Frage 'DNS-Dienst jetzt starten?' -Vorschlag $true)) {
+                $r = Invoke-NetChange -Titel 'DNS-Dienst starten' -Stufe Automatisch -Aktion { Start-Service -Name DNS }
+                return [bool]$r.Erfolg
+            }
+            return $false
+        }
+        return $true
+    }
+    if ($Still) { return $false }
+    Write-Log -Level Warn -Message 'Der DNS-Server ist auf diesem Server nicht (vollstaendig) installiert.'
+    if (Read-NetYesNo -Frage 'DNS-Server-Rolle jetzt installieren?' -Vorschlag $true) { return (Install-NetDnsRole) }
+    return $false
+}
+#
+function Get-NetDnsZoneInfo {
+    <#
+    .SYNOPSIS
+        Liefert die Zonen (ohne automatisch erzeugte und TrustAnchors) als einfache Objekte.
+    #>
+    param([ValidateSet('Alle', 'Forward', 'Reverse', 'Primaer')][string]$Art = 'Alle')
+    $liste = @()
+    foreach ($z in @(Get-NetSafe -Beschreibung 'Get-DnsServerZone' -Standard @() -Abfrage { Get-DnsServerZone })) {
+        if ($null -eq $z -or $z.IsAutoCreated -or [string]$z.ZoneName -eq 'TrustAnchors') { continue }
+        $o = [pscustomobject]@{
+            Name         = [string]$z.ZoneName
+            Typ          = [string]$z.ZoneType
+            AdIntegriert = [bool]$z.IsDsIntegrated
+            Reverse      = [bool]$z.IsReverseLookupZone
+            Updates      = [string]$z.DynamicUpdate
+            Replikation  = [string]$z.ReplicationScope
+        }
+        switch ($Art) {
+            'Forward' { if (-not $o.Reverse -and $o.Typ -ne 'Forwarder') { $liste += $o } }
+            'Reverse' { if ($o.Reverse) { $liste += $o } }
+            'Primaer' { if ($o.Typ -eq 'Primary') { $liste += $o } }
+            default { $liste += $o }
+        }
+    }
+    return $liste
+}
+#
+function Select-NetDnsZone {
+    param([ValidateSet('Alle', 'Forward', 'Reverse', 'Primaer')][string]$Art = 'Alle', [string]$Titel = 'Zone waehlen')
+    $zonen = @(Get-NetDnsZoneInfo -Art $Art | Where-Object { $_.Typ -eq 'Primary' -or $Art -eq 'Alle' })
+    if ($zonen.Count -eq 0) {
+        Write-Log -Level Warn -Message 'Es gibt keine passende Zone. Zuerst eine Zone anlegen.'
+        return $null
+    }
+    if ($zonen.Count -eq 1) { return $zonen[0] }
+    return (Select-NetItem -Elemente $zonen -Titel $Titel -Eigenschaften @('Name', 'Typ', 'Updates', 'Replikation'))
+}
+#
+function Show-NetDnsZone {
+    Write-NetTitle -Titel 'DNS-Zonen'
+    $zonen = @(Get-NetDnsZoneInfo)
+    if ($zonen.Count -eq 0) { Write-Log -Level Warn -Message 'Keine Zonen vorhanden.'; return }
+    Write-Host ('  {0,-38} {1,-10} {2,-16} {3}' -f 'Zone', 'Typ', 'Speicherung', 'Dynamische Updates')
+    foreach ($z in $zonen) {
+        $art = 'Datei'
+        if ($z.AdIntegriert) { $art = 'AD (' + $z.Replikation + ')' }
+        $farbe = 'Gray'
+        if ($z.Typ -eq 'Primary' -and $z.Updates -eq 'None' -and -not $z.Reverse) { $farbe = 'Yellow' }
+        Write-Host ('  {0,-38} {1,-10} {2,-16} {3}' -f $z.Name, $z.Typ, $art, (ConvertTo-NetDnsUpdateText -Wert $z.Updates)) -ForegroundColor $farbe
+    }
+}
+#
+function ConvertTo-NetDnsUpdateText {
+    param([string]$Wert)
+    switch ($Wert) {
+        'Secure' { return 'nur sicher (empfohlen)' }
+        'NonsecureAndSecure' { return 'sicher und unsicher' }
+        'None' { return 'aus' }
+        default { return $Wert }
+    }
+}
+#
+function ConvertTo-NetDnsRecord {
+    <#
+    .SYNOPSIS
+        Wandelt einen DNS-Eintrag in ein einfaches Objekt mit Typ, Daten (Hashtable) und Anzeigetext.
+    #>
+    param([Parameter(Mandatory = $true)][object]$Eintrag, [string]$Zone = '')
+    $typ = [string]$Eintrag.RecordType
+    $rd = $Eintrag.RecordData
+    $daten = @{}
+    $text = ''
+    switch ($typ) {
+        'A' { $daten.IPv4Address = ConvertTo-NetString -Wert $rd.IPv4Address; $text = $daten.IPv4Address }
+        'AAAA' { $daten.IPv6Address = ConvertTo-NetString -Wert $rd.IPv6Address; $text = $daten.IPv6Address }
+        'CNAME' { $daten.HostNameAlias = [string]$rd.HostNameAlias; $text = $daten.HostNameAlias }
+        'MX' { $daten.MailExchange = [string]$rd.MailExchange; $daten.Preference = [int]$rd.Preference; $text = '{0} {1}' -f $daten.Preference, $daten.MailExchange }
+        'SRV' { $daten.DomainName = [string]$rd.DomainName; $daten.Priority = [int]$rd.Priority; $daten.Weight = [int]$rd.Weight; $daten.Port = [int]$rd.Port; $text = '{0} {1} {2} {3}' -f $daten.Priority, $daten.Weight, $daten.Port, $daten.DomainName }
+        'TXT' { $daten.DescriptiveText = [string]$rd.DescriptiveText; $text = $daten.DescriptiveText }
+        'PTR' { $daten.PtrDomainName = [string]$rd.PtrDomainName; $text = $daten.PtrDomainName }
+        'NS' { $text = [string]$rd.NameServer }
+        'SOA' { $text = [string]$rd.PrimaryServer }
+        default { $text = '(' + $typ + ')' }
+    }
+    $zeit = $null
+    if ($Eintrag.Timestamp) { $zeit = [datetime]$Eintrag.Timestamp }
+    return [pscustomobject]@{
+        Zone       = $Zone
+        Name       = [string]$Eintrag.HostName
+        Typ        = $typ
+        Wert       = $text
+        Daten      = $daten
+        Zeitstempel = $zeit
+        Statisch   = ($null -eq $zeit)
+        Ttl        = [string]$Eintrag.TimeToLive
+    }
+}
+#
+function Get-NetDnsRecord {
+    <#
+    .SYNOPSIS
+        Liest Eintraege einer Zone (optional nach Name und Typ gefiltert).
+    #>
+    param([Parameter(Mandatory = $true)][string]$Zone, [string]$Name, [string]$Typ)
+    $p = @{ ZoneName = $Zone }
+    if ($Name) { $p.Name = $Name }
+    if ($Typ) { $p.RRType = $Typ }
+    $liste = @()
+    foreach ($e in @(Get-NetSafe -Beschreibung "Eintraege $Zone" -Standard @() -Abfrage { Get-DnsServerResourceRecord @p })) {
+        if ($e) { $liste += (ConvertTo-NetDnsRecord -Eintrag $e -Zone $Zone) }
+    }
+    return $liste
+}
+#
+function Test-NetDnsRecordEqual {
+    param([hashtable]$A, [hashtable]$B)
+    foreach ($k in $A.Keys) {
+        if ([string]$A[$k] -ne [string]$B[$k]) {
+            $x = ([string]$A[$k]).TrimEnd('.')
+            $y = ([string]$B[$k]).TrimEnd('.')
+            if ($x -ne $y) { return $false }
+        }
+    }
+    return $true
+}
+#
+function Add-NetDnsRecordExact {
+    <#
+    .SYNOPSIS
+        Legt genau einen Eintrag an. Wird auch als Gegenaktion in der Rueckgaengig-Liste verwendet.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$ZoneName,
+        [Parameter(Mandatory = $true)][string]$Name,
+        [Parameter(Mandatory = $true)][ValidateSet('A', 'AAAA', 'CNAME', 'MX', 'SRV', 'TXT', 'PTR')][string]$Typ,
+        [Parameter(Mandatory = $true)][hashtable]$Daten,
+        [switch]$CreatePtr
+    )
+    switch ($Typ) {
+        'A' {
+            if ($CreatePtr) { Add-DnsServerResourceRecordA -ZoneName $ZoneName -Name $Name -IPv4Address $Daten.IPv4Address -CreatePtr }
+            else { Add-DnsServerResourceRecordA -ZoneName $ZoneName -Name $Name -IPv4Address $Daten.IPv4Address }
+        }
+        'AAAA' { Add-DnsServerResourceRecordAAAA -ZoneName $ZoneName -Name $Name -IPv6Address $Daten.IPv6Address }
+        'CNAME' { Add-DnsServerResourceRecordCName -ZoneName $ZoneName -Name $Name -HostNameAlias $Daten.HostNameAlias }
+        'MX' { Add-DnsServerResourceRecordMX -ZoneName $ZoneName -Name $Name -MailExchange $Daten.MailExchange -Preference ([uint16]$Daten.Preference) }
+        'SRV' { Add-DnsServerResourceRecord -Srv -ZoneName $ZoneName -Name $Name -DomainName $Daten.DomainName -Priority ([uint16]$Daten.Priority) -Weight ([uint16]$Daten.Weight) -Port ([uint16]$Daten.Port) }
+        'TXT' { Add-DnsServerResourceRecord -Txt -ZoneName $ZoneName -Name $Name -DescriptiveText $Daten.DescriptiveText }
+        'PTR' { Add-DnsServerResourceRecordPtr -ZoneName $ZoneName -Name $Name -PtrDomainName $Daten.PtrDomainName }
+    }
+}
+#
+function Remove-NetDnsRecordExact {
+    <#
+    .SYNOPSIS
+        Loescht genau den Eintrag mit diesen Daten (andere Eintraege gleichen Namens bleiben).
+        Wird auch als Gegenaktion in der Rueckgaengig-Liste verwendet.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$ZoneName,
+        [Parameter(Mandatory = $true)][string]$Name,
+        [Parameter(Mandatory = $true)][string]$Typ,
+        [Parameter(Mandatory = $true)][hashtable]$Daten
+    )
+    $treffer = 0
+    foreach ($e in @(Get-DnsServerResourceRecord -ZoneName $ZoneName -Name $Name -RRType $Typ -ErrorAction SilentlyContinue)) {
+        if ($null -eq $e) { continue }
+        $o = ConvertTo-NetDnsRecord -Eintrag $e -Zone $ZoneName
+        if (Test-NetDnsRecordEqual -A $Daten -B $o.Daten) {
+            $e | Remove-DnsServerResourceRecord -ZoneName $ZoneName -Force
+            $treffer++
+        }
+    }
+    if ($treffer -eq 0) { Write-Log -Level Warn -Message ('Eintrag {0} ({1}) in {2} war nicht (mehr) vorhanden.' -f $Name, $Typ, $ZoneName) }
+}
+# ----------------------------------------------------------------------
+# src/dns/DnsZonen.ps1
+# ----------------------------------------------------------------------
+# DNS-Zonen: anlegen (AD-integriert auf DCs, sonst dateibasiert), dynamische Updates,
+# fehlende Reverse-Zonen vorschlagen, loeschen (Gefaehrlich).
+#
+function Test-NetIsDomainController {
+    $z = $script:NS.Zustand
+    if ($z -and $z.System) { return [bool]$z.System.IstDC }
+    $cs = Get-NetSafe -Beschreibung 'DomainRole' -Abfrage { Get-CimInstance -ClassName Win32_ComputerSystem }
+    return ($cs -and [int]$cs.DomainRole -ge 4)
+}
+#
+function Read-NetDnsZoneStorage {
+    <#
+    .SYNOPSIS
+        Fragt Speicherung und dynamische Updates fuer eine neue Zone ab.
+    #>
+    $ergebnis = @{ AdIntegriert = $false; Replikation = ''; Updates = 'None' }
+    if (Test-NetIsDomainController) {
+        $ergebnis.AdIntegriert = $true
+        $i = Read-NetChoice -Frage 'Replikation der AD-integrierten Zone' -Optionen @(
+            'Domain - auf alle DNS-Server der Domaene (ueblich)',
+            'Forest - auf alle DNS-Server der Gesamtstruktur') -Vorschlag 1
+        if ($i -lt 0) { return $null }
+        $ergebnis.Replikation = @('Domain', 'Forest')[$i]
+        $j = Read-NetChoice -Frage 'Dynamische Updates' -Optionen @(
+            'Nur sicher (empfohlen: nur Domaenenmitglieder und der DHCP-Server duerfen eintragen)',
+            'Sicher und unsicher (jedes Geraet darf eintragen - nicht empfohlen)',
+            'Aus (nur manuelle Eintraege)') -Vorschlag 1
+        if ($j -lt 0) { return $null }
+        $ergebnis.Updates = @('Secure', 'NonsecureAndSecure', 'None')[$j]
+    }
+    else {
+        Write-NetText -Text 'Ohne Domaenencontroller wird die Zone als Datei gespeichert. Sichere Updates gibt es dann nicht.'
+        $j = Read-NetChoice -Frage 'Dynamische Updates' -Optionen @(
+            'Sicher und unsicher (noetig, damit der DHCP-Server Clients eintragen kann)',
+            'Aus (nur manuelle Eintraege)') -Vorschlag 1
+        if ($j -lt 0) { return $null }
+        $ergebnis.Updates = @('NonsecureAndSecure', 'None')[$j]
+    }
+    return $ergebnis
+}
+#
+function New-NetDnsZone {
+    <#
+    .SYNOPSIS
+        Legt eine primaere Zone an (idempotent: existiert sie schon, passiert nichts).
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$Name,
+        [hashtable]$Speicherung,
+        [string]$Netz = ''
+    )
+    $Name = $Name.Trim().TrimEnd('.').ToLower()
+    $vorhanden = Get-NetSafe -Beschreibung "Zone $Name" -Abfrage { Get-DnsServerZone -Name $Name }
+    if ($vorhanden) {
+        Write-Log -Level OK -Message ("Die Zone {0} existiert bereits ({1}). Nichts zu tun." -f $Name, [string]$vorhanden.ZoneType)
+        return $true
+    }
+    if (-not $Speicherung) { $Speicherung = Read-NetDnsZoneStorage }
+    if (-not $Speicherung) { return $false }
+    $p = @{ Name = $Name; DynamicUpdate = $Speicherung.Updates }
+    if ($Speicherung.AdIntegriert) { $p.ReplicationScope = $Speicherung.Replikation }
+    else { $p.ZoneFile = $Name + '.dns' }
+    $nachher = @{ Zone = $Name; Speicherung = $(if ($Speicherung.AdIntegriert) { 'AD (' + $Speicherung.Replikation + ')' } else { 'Datei ' + $p.ZoneFile }); Updates = (ConvertTo-NetDnsUpdateText -Wert $Speicherung.Updates) }
+    if ($Netz) { $nachher.Netz = $Netz }
+    $r = Invoke-NetChange -Titel "DNS-Zone $Name anlegen" -Stufe Bestaetigen -Vorher '(Zone nicht vorhanden)' -Nachher $nachher -BackupBereich @('Dns') -Aktion {
+        Add-DnsServerPrimaryZone @p
+    } -Rueckgaengig @{ Befehl = 'Remove-DnsServerZone'; Parameter = @{ Name = $Name; Force = $true } }
+    return [bool]($r.Erfolg -and -not $r.Probelauf)
+}
+#
+function New-NetDnsForwardZone {
+    <#
+    .SYNOPSIS
+        Menue: Forward-Zone anlegen (z. B. die Domaene oder eine interne Zone ohne AD).
+    #>
+    if (-not (Test-NetDnsReady)) { return }
+    $vorschlag = Get-NetDomainName
+    Write-NetText -Text 'Eine Forward-Zone loest Namen in Adressen auf. Auf einem DC gibt es die Zone der Domaene schon nach der Heraufstufung.'
+    $name = Read-NetText -Frage 'Name der Zone (z. B. ad.firma.ch)' -Vorschlag $vorschlag -Pruefung { param($t) (Test-NetDomainName -Name $t).Fehler }
+    if (-not $name) { return }
+    New-NetDnsZone -Name $name | Out-Null
+}
+#
+function New-NetDnsReverseZone {
+    <#
+    .SYNOPSIS
+        Menue: Reverse-Zone(n) fuer ein Netz anlegen.
+    #>
+    param([string]$Netz)
+    if (-not (Test-NetDnsReady)) { return }
+    Write-NetText -Text 'Eine Reverse-Zone loest Adressen in Namen auf (PTR). Pro Netz wird eine Zone gebraucht, z. B. 1.168.192.in-addr.arpa fuer 192.168.1.0/24.'
+    $s = $null
+    if ($Netz) { $s = ConvertTo-NetSubnet -Text $Netz }
+    else { $s = Read-NetSubnet -Frage 'Netz (z. B. 192.168.1.0/24)' }
+    if (-not $s) { return }
+    if ($s.Prefix -lt 8) { Write-Log -Level Fehler -Message 'Netze groesser als /8 werden nicht unterstuetzt.'; return }
+    $speicherung = $null
+    foreach ($zone in @(Get-NetReverseZoneName -NetworkAddress $s.Netz -PrefixLength $s.Prefix)) {
+        $existiert = Get-NetSafe -Beschreibung "Zone $zone" -Abfrage { Get-DnsServerZone -Name $zone }
+        if ($existiert) { Write-Log -Level OK -Message "Reverse-Zone $zone existiert bereits."; continue }
+        if (-not $speicherung) { $speicherung = Read-NetDnsZoneStorage }
+        if (-not $speicherung) { return }
+        New-NetDnsZone -Name $zone -Speicherung $speicherung -Netz $s.Text | Out-Null
+    }
+}
+#
+function Get-NetMissingReverseZone {
+    <#
+    .SYNOPSIS
+        Ermittelt fehlende Reverse-Zonen fuer das Server-Netz und alle DHCP-Scopes.
+    #>
+    param([hashtable]$Zustand = (Get-NetSetupState))
+    $netze = @()
+    foreach ($k in @($Zustand.Netzwerk.AktiveKarten)) {
+        foreach ($a in @($k.Adressen)) {
+            if ($a.IP -like '169.254.*') { continue }
+            $netze += [pscustomobject]@{ Netz = (Get-NetNetworkAddress -IPAddress $a.IP -PrefixLength $a.Prefix); Prefix = [int]$a.Prefix; Quelle = ('Netzwerkkarte ' + $k.Name) }
+        }
+    }
+    foreach ($sc in @($Zustand.Dhcp.Scopes)) {
+        if ($sc.Prefix -gt 0) { $netze += [pscustomobject]@{ Netz = $sc.ScopeId; Prefix = [int]$sc.Prefix; Quelle = ('DHCP-Scope ' + $sc.Name) } }
+    }
+    $zonen = @($Zustand.Dns.Zonen | Where-Object { $_.Reverse } | ForEach-Object { $_.Name })
+    $fehlend = @()
+    $gesehen = @{}
+    foreach ($n in $netze) {
+        if ($n.Prefix -lt 8) { continue }
+        foreach ($zone in @(Get-NetReverseZoneName -NetworkAddress $n.Netz -PrefixLength $n.Prefix)) {
+            if ($gesehen.ContainsKey($zone)) { continue }
+            $gesehen[$zone] = $true
+            # Eine groessere Zone (z. B. 168.192.in-addr.arpa) deckt das Netz ebenfalls ab.
+            $teile = $zone.Replace('.in-addr.arpa', '').Split('.')
+            [Array]::Reverse($teile)
+            $beispiel = (@($teile) + @('0', '0', '0', '1'))[0..3] -join '.'
+            if (Find-NetReverseZone -IPAddress $beispiel -ZoneNames $zonen) { continue }
+            $fehlend += [pscustomobject]@{ Zone = $zone; Netz = ('{0}/{1}' -f $n.Netz, $n.Prefix); Quelle = $n.Quelle }
+        }
+    }
+    return $fehlend
+}
+#
+function Add-NetMissingReverseZone {
+    <#
+    .SYNOPSIS
+        Schlaegt fehlende Reverse-Zonen vor und legt die gewaehlten an.
+    #>
+    if (-not (Test-NetDnsReady)) { return }
+    $fehlend = @(Get-NetMissingReverseZone)
+    if ($fehlend.Count -eq 0) {
+        Write-Log -Level OK -Message 'Fuer alle Netze (Server und DHCP-Scopes) gibt es eine Reverse-Zone.'
+        return
+    }
+    Write-Log -Level Warn -Message ('{0} Reverse-Zone(n) fehlen. Ohne sie gibt es keine PTR-Eintraege (Adresse -> Name).' -f $fehlend.Count)
+    $wahl = @(Select-NetItem -Elemente $fehlend -Titel 'Welche Reverse-Zonen anlegen?' -Eigenschaften @('Zone', 'Netz', 'Quelle') -Mehrfach)
+    if ($wahl.Count -eq 0) { return }
+    $speicherung = Read-NetDnsZoneStorage
+    if (-not $speicherung) { return }
+    foreach ($f in $wahl) { New-NetDnsZone -Name $f.Zone -Speicherung $speicherung -Netz $f.Netz | Out-Null }
+}
+#
+function Set-NetDnsZoneUpdate {
+    <#
+    .SYNOPSIS
+        Stellt die dynamischen Updates einer Zone ein.
+    #>
+    param([string]$Zone, [ValidateSet('', 'Secure', 'NonsecureAndSecure', 'None')][string]$Wert = '')
+    if (-not (Test-NetDnsReady)) { return $false }
+    $z = $null
+    if ($Zone) { $z = @(Get-NetDnsZoneInfo -Art Primaer | Where-Object { $_.Name -eq $Zone }) | Select-Object -First 1 }
+    else { $z = Select-NetDnsZone -Art Primaer -Titel 'Zone fuer dynamische Updates waehlen' }
+    if (-not $z) { return $false }
+    if (-not $Wert) {
+        $optionen = @('Nur sicher (empfohlen)', 'Sicher und unsicher', 'Aus')
+        $werte = @('Secure', 'NonsecureAndSecure', 'None')
+        if (-not $z.AdIntegriert) { $optionen = @('Sicher und unsicher', 'Aus'); $werte = @('NonsecureAndSecure', 'None') }
+        $i = Read-NetChoice -Frage ('Dynamische Updates fuer {0} (aktuell: {1})' -f $z.Name, (ConvertTo-NetDnsUpdateText -Wert $z.Updates)) -Optionen $optionen -Vorschlag 1
+        if ($i -lt 0) { return $false }
+        $Wert = $werte[$i]
+    }
+    if ($Wert -eq 'Secure' -and -not $z.AdIntegriert) {
+        Write-Log -Level Fehler -Message 'Sichere Updates gibt es nur bei AD-integrierten Zonen (auf einem DC).'
+        return $false
+    }
+    if ($z.Updates -eq $Wert) { Write-Log -Level OK -Message ('Die Zone {0} ist bereits so eingestellt.' -f $z.Name); return $true }
+    $name = $z.Name
+    $r = Invoke-NetChange -Titel "Dynamische Updates der Zone $name einstellen" -Stufe Bestaetigen -Vorher (ConvertTo-NetDnsUpdateText -Wert $z.Updates) -Nachher (ConvertTo-NetDnsUpdateText -Wert $Wert) -BackupBereich @('Dns') -Aktion {
+        Set-DnsServerPrimaryZone -Name $name -DynamicUpdate $Wert
+    } -Rueckgaengig @{ Befehl = 'Set-DnsServerPrimaryZone'; Parameter = @{ Name = $name; DynamicUpdate = $z.Updates } }
+    return [bool]($r.Erfolg -and -not $r.Probelauf)
+}
+#
+function Remove-NetDnsZone {
+    <#
+    .SYNOPSIS
+        Loescht eine Zone (Stufe Gefaehrlich: vorher Backup, Servername eintippen).
+    #>
+    if (-not (Test-NetDnsReady)) { return }
+    $z = Select-NetDnsZone -Art Alle -Titel 'Welche Zone loeschen?'
+    if (-not $z) { return }
+    $name = $z.Name
+    if ($name -like '_msdcs.*' -or $name -eq (Get-NetDomainName)) {
+        Write-Log -Level Warn -Message 'Diese Zone gehoert zum Active Directory. Ohne sie funktioniert die Anmeldung an der Domaene nicht mehr!'
+    }
+    $anzahl = @(Get-NetDnsRecord -Zone $name).Count
+    $r = Invoke-NetChange -Titel "DNS-Zone $name loeschen" -Stufe Gefaehrlich -Vorher @{ Zone = $name; Eintraege = $anzahl; Typ = $z.Typ } -Nachher '(Zone geloescht)' -BackupBereich @('Dns') `
+        -Hinweis 'Alle Eintraege der Zone gehen verloren. Sie lassen sich nur aus dem Backup (CSV) wiederherstellen.' -Aktion {
+        Remove-DnsServerZone -Name $name -Force
+    }
+    if ($r.Erfolg -and -not $r.Probelauf) { Write-Log -Level OK -Message "Zone $name geloescht. Wiederherstellung ueber das Backup-Menue (DNS-Eintraege aus CSV)." }
+}
+# ----------------------------------------------------------------------
+# src/dns/DnsEintraege.ps1
+# ----------------------------------------------------------------------
+# DNS-Eintraege: A (optional mit PTR), AAAA, CNAME, MX, SRV, TXT, PTR anlegen, aendern, loeschen
+# und suchen. Vor dem Anlegen wird auf Duplikate und Konflikte geprueft (idempotent).
+#
+$script:NetDnsTypen = @('A', 'AAAA', 'CNAME', 'MX', 'SRV', 'TXT', 'PTR')
+#
+function Test-NetIPv6Address {
+    param([AllowEmptyString()][string]$Text)
+    $ip = $null
+    if (-not [System.Net.IPAddress]::TryParse($Text, [ref]$ip)) { return $false }
+    return ($ip.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetworkV6)
+}
+#
+function Test-NetDnsRecordName {
+    <#
+    .SYNOPSIS
+        Prueft einen relativen Namen ('@' fuer die Zone selbst). Liefert $null oder den Grund.
+    #>
+    param([string]$Name, [switch]$Srv)
+    if ($Name -eq '@') { return $null }
+    if (-not $Name) { return 'Bitte einen Namen eingeben (oder @ fuer die Zone selbst).' }
+    foreach ($teil in $Name.TrimEnd('.').Split('.')) {
+        if ($Srv -and $teil -match '^_[A-Za-z0-9-]+$') { continue }
+        if ($teil -eq '*') { continue }
+        if (-not (Test-NetDnsLabel -Label $teil)) { return "Der Teil '$teil' ist ungueltig (a-z, 0-9, Bindestrich; bei SRV z. B. _sip._tcp)." }
+    }
+    return $null
+}
+#
+function Read-NetDnsRecordData {
+    <#
+    .SYNOPSIS
+        Fragt die Daten eines Eintragstyps ab und liefert eine Hashtable (oder $null bei Abbruch).
+    #>
+    param([Parameter(Mandatory = $true)][string]$Typ, [hashtable]$Vorschlag = @{})
+    $fqdn = { param($t) if ((Test-NetDomainName -Name $t).Gueltig -or $t -match '^[A-Za-z0-9-]+$') { $null } else { 'Bitte einen gueltigen Namen eingeben, z. B. srv01.ad.firma.ch' } }
+    switch ($Typ) {
+        'A' {
+            $ip = Read-NetIPAddress -Frage 'IPv4-Adresse' -Vorschlag ([string]$Vorschlag.IPv4Address)
+            if (-not $ip) { return $null }
+            return @{ IPv4Address = $ip }
+        }
+        'AAAA' {
+            $ip = Read-NetText -Frage 'IPv6-Adresse' -Vorschlag ([string]$Vorschlag.IPv6Address) -Pruefung { param($t) if (Test-NetIPv6Address -Text $t) { $null } else { 'Keine gueltige IPv6-Adresse.' } }
+            if (-not $ip) { return $null }
+            return @{ IPv6Address = $ip }
+        }
+        'CNAME' {
+            $ziel = Read-NetText -Frage 'Ziel (vollstaendiger Name, z. B. srv01.ad.firma.ch)' -Vorschlag ([string]$Vorschlag.HostNameAlias) -Pruefung $fqdn
+            if (-not $ziel) { return $null }
+            return @{ HostNameAlias = $ziel }
+        }
+        'MX' {
+            $mx = Read-NetText -Frage 'Mailserver (vollstaendiger Name)' -Vorschlag ([string]$Vorschlag.MailExchange) -Pruefung $fqdn
+            if (-not $mx) { return $null }
+            $pref = Read-NetNumber -Frage 'Prioritaet (kleiner = bevorzugt)' -Minimum 0 -Maximum 65535 -Vorschlag $(if ($Vorschlag.Preference) { [int]$Vorschlag.Preference } else { 10 })
+            if ($null -eq $pref) { return $null }
+            return @{ MailExchange = $mx; Preference = $pref }
+        }
+        'SRV' {
+            $ziel = Read-NetText -Frage 'Zielserver (vollstaendiger Name)' -Vorschlag ([string]$Vorschlag.DomainName) -Pruefung $fqdn
+            if (-not $ziel) { return $null }
+            $prio = Read-NetNumber -Frage 'Prioritaet' -Minimum 0 -Maximum 65535 -Vorschlag $(if ($null -ne $Vorschlag.Priority) { [int]$Vorschlag.Priority } else { 0 })
+            if ($null -eq $prio) { return $null }
+            $gew = Read-NetNumber -Frage 'Gewichtung' -Minimum 0 -Maximum 65535 -Vorschlag $(if ($null -ne $Vorschlag.Weight) { [int]$Vorschlag.Weight } else { 100 })
+            if ($null -eq $gew) { return $null }
+            $port = Read-NetNumber -Frage 'Port' -Minimum 1 -Maximum 65535 -Vorschlag $(if ($Vorschlag.Port) { [int]$Vorschlag.Port } else { $null })
+            if ($null -eq $port) { return $null }
+            return @{ DomainName = $ziel; Priority = $prio; Weight = $gew; Port = $port }
+        }
+        'TXT' {
+            $text = Read-NetText -Frage 'Text (z. B. v=spf1 mx -all)' -Vorschlag ([string]$Vorschlag.DescriptiveText) -Pruefung { param($t) if ($t.Length -gt 255) { 'Hoechstens 255 Zeichen pro Text.' } else { $null } }
+            if (-not $text) { return $null }
+            return @{ DescriptiveText = $text }
+        }
+        'PTR' {
+            $ziel = Read-NetText -Frage 'Name, auf den die Adresse zeigt (z. B. pc01.ad.firma.ch)' -Vorschlag ([string]$Vorschlag.PtrDomainName) -Pruefung $fqdn
+            if (-not $ziel) { return $null }
+            return @{ PtrDomainName = $ziel }
+        }
+    }
+    return $null
+}
+#
+function Test-NetDnsRecordConflict {
+    <#
+    .SYNOPSIS
+        Prueft vor dem Anlegen auf Duplikat (gleiche Daten) und Konflikte (CNAME, andere Adresse).
+    .OUTPUTS
+        PSCustomObject mit Duplikat (bool), Konflikte (Liste), Vorhanden (Liste).
+    #>
+    param([Parameter(Mandatory = $true)][string]$Zone, [Parameter(Mandatory = $true)][string]$Name, [Parameter(Mandatory = $true)][string]$Typ, [Parameter(Mandatory = $true)][hashtable]$Daten)
+    $vorhanden = @(Get-NetDnsRecord -Zone $Zone -Name $Name)
+    $gleich = @($vorhanden | Where-Object { $_.Typ -eq $Typ -and (Test-NetDnsRecordEqual -A $Daten -B $_.Daten) })
+    $konflikte = @()
+    if ($Typ -eq 'CNAME') {
+        $konflikte += @($vorhanden | Where-Object { $_.Typ -ne 'CNAME' -or -not (Test-NetDnsRecordEqual -A $Daten -B $_.Daten) } | ForEach-Object { '{0} {1} ist vorhanden - ein CNAME darf nicht neben anderen Eintraegen stehen.' -f $_.Typ, $_.Wert })
+    }
+    else {
+        $konflikte += @($vorhanden | Where-Object { $_.Typ -eq 'CNAME' } | ForEach-Object { 'Der Name ist bereits ein CNAME auf {0}.' -f $_.Wert })
+        if ($Typ -eq 'A' -or $Typ -eq 'AAAA' -or $Typ -eq 'PTR') {
+            $konflikte += @($vorhanden | Where-Object { $_.Typ -eq $Typ -and -not (Test-NetDnsRecordEqual -A $Daten -B $_.Daten) } | ForEach-Object { 'Es gibt schon einen {0}-Eintrag mit {1}.' -f $_.Typ, $_.Wert })
+        }
+    }
+    return [pscustomobject]@{ Duplikat = ($gleich.Count -gt 0); Konflikte = $konflikte; Vorhanden = $vorhanden }
+}
+#
+function Add-NetDnsRecord {
+    <#
+    .SYNOPSIS
+        Legt einen DNS-Eintrag an (mit Duplikat- und Konfliktpruefung, optional PTR zum A-Eintrag).
+    #>
+    param(
+        [string]$Zone,
+        [string]$Name,
+        [ValidateSet('', 'A', 'AAAA', 'CNAME', 'MX', 'SRV', 'TXT', 'PTR')][string]$Typ = '',
+        [hashtable]$Daten,
+        [Nullable[bool]]$MitPtr = $null
+    )
+    if (-not (Test-NetDnsReady)) { return $false }
+    if (-not $Typ) {
+        $i = Read-NetChoice -Frage 'Welcher Eintragstyp?' -Optionen @(
+            'A - Name zu IPv4-Adresse (optional mit PTR)', 'AAAA - Name zu IPv6-Adresse', 'CNAME - Alias auf einen anderen Namen',
+            'MX - Mailserver', 'SRV - Dienst mit Port', 'TXT - Text (z. B. SPF)', 'PTR - Adresse zu Name') -Vorschlag 1
+        if ($i -lt 0) { return $false }
+        $Typ = $script:NetDnsTypen[$i]
+    }
+    if (-not $Zone) {
+        $art = 'Forward'
+        if ($Typ -eq 'PTR') { $art = 'Reverse' }
+        $z = Select-NetDnsZone -Art $art -Titel 'In welche Zone?'
+        if (-not $z) { return $false }
+        $Zone = $z.Name
+    }
+    if (-not $Name) {
+        $frage = 'Name (relativ zur Zone, @ = Zone selbst)'
+        if ($Typ -eq 'PTR') { $frage = 'Letzte(s) Oktett(e) der Adresse in umgekehrter Reihenfolge (z. B. 50 fuer .50)' }
+        if ($Typ -eq 'SRV') { $frage = 'Name, z. B. _sip._tcp' }
+        $istSrv = ($Typ -eq 'SRV')
+        $Name = Read-NetText -Frage $frage -Pruefung { param($t) Test-NetDnsRecordName -Name $t -Srv:$istSrv }
+        if (-not $Name) { return $false }
+    }
+    if (-not $Daten) { $Daten = Read-NetDnsRecordData -Typ $Typ }
+    if (-not $Daten) { return $false }
+#
+    $pruef = Test-NetDnsRecordConflict -Zone $Zone -Name $Name -Typ $Typ -Daten $Daten
+    if ($pruef.Duplikat) {
+        Write-Log -Level OK -Message ('Der Eintrag {0} {1} {2} existiert bereits in {3}. Nichts zu tun.' -f $Name, $Typ, (($Daten.Values | ForEach-Object { [string]$_ }) -join ' '), $Zone)
+        return $true
+    }
+    foreach ($k in $pruef.Konflikte) { Write-Log -Level Warn -Message $k }
+    if ($pruef.Konflikte.Count -gt 0 -and -not (Read-NetYesNo -Frage 'Trotzdem zusaetzlich anlegen?' -Vorschlag $false)) { return $false }
+#
+    $ptr = $false
+    if ($Typ -eq 'A') {
+        $reverse = Find-NetReverseZone -IPAddress $Daten.IPv4Address -ZoneNames @(Get-NetDnsZoneInfo -Art Reverse | ForEach-Object { $_.Name })
+        if ($null -eq $MitPtr) {
+            if ($reverse) { $MitPtr = Read-NetYesNo -Frage ('Passenden PTR-Eintrag in {0} mit anlegen?' -f $reverse) -Vorschlag $true }
+            else { Write-Log -Level Warn -Message ('Fuer {0} gibt es keine Reverse-Zone, deshalb kein PTR. Tipp: DNS-Menue -> Zonen -> Fehlende Reverse-Zonen.' -f $Daten.IPv4Address); $MitPtr = $false }
+        }
+        $ptr = [bool]$MitPtr -and [bool]$reverse
+    }
+    $zoneName = $Zone
+    $eintragName = $Name
+    $eintragTyp = $Typ
+    $eintragDaten = $Daten
+    $rueck = @(@{ Befehl = 'Remove-NetDnsRecordExact'; Parameter = @{ ZoneName = $zoneName; Name = $eintragName; Typ = $eintragTyp; Daten = $eintragDaten } })
+    if ($ptr) {
+        $rz = Find-NetReverseZone -IPAddress $Daten.IPv4Address -ZoneNames @(Get-NetDnsZoneInfo -Art Reverse | ForEach-Object { $_.Name })
+        $voll = $Name
+        if ($Name -eq '@') { $voll = $Zone } else { $voll = $Name + '.' + $Zone }
+        $rueck += @{ Befehl = 'Remove-NetDnsRecordExact'; Parameter = @{ ZoneName = $rz; Name = (Get-NetPtrName -IPAddress $Daten.IPv4Address -ZoneName $rz); Typ = 'PTR'; Daten = @{ PtrDomainName = $voll + '.' } } }
+    }
+    $anzeige = @{ Zone = $Zone; Name = $Name; Typ = $Typ; Wert = (($Daten.Keys | Sort-Object | ForEach-Object { '{0}={1}' -f $_, $Daten[$_] }) -join ', ') }
+    if ($Typ -eq 'A') { $anzeige.PTR = $(if ($ptr) { 'ja' } else { 'nein' }) }
+    $r = Invoke-NetChange -Titel ('DNS-Eintrag {0} ({1}) in {2} anlegen' -f $Name, $Typ, $Zone) -Stufe Bestaetigen -Vorher @($pruef.Vorhanden | ForEach-Object { '{0} {1}' -f $_.Typ, $_.Wert }) -Nachher $anzeige -BackupBereich @('Dns') -Aktion {
+        Add-NetDnsRecordExact -ZoneName $zoneName -Name $eintragName -Typ $eintragTyp -Daten $eintragDaten -CreatePtr:$ptr
+    } -Rueckgaengig $rueck
+    return [bool]($r.Erfolg -and -not $r.Probelauf)
+}
+#
+function Select-NetDnsRecord {
+    param([string]$Titel = 'Eintrag waehlen')
+    $z = Select-NetDnsZone -Art Alle -Titel 'Zone waehlen'
+    if (-not $z) { return $null }
+    $filter = Read-NetText -Frage 'Nur Namen mit diesem Text zeigen (leer = alle)' -LeerErlaubt
+    if ($null -eq $filter) { return $null }
+    $liste = @(Get-NetDnsRecord -Zone $z.Name | Where-Object { $script:NetDnsTypen -contains $_.Typ -and (-not $filter -or $_.Name -like "*$filter*" -or $_.Wert -like "*$filter*") })
+    return (Select-NetItem -Elemente $liste -Titel $Titel -Eigenschaften @('Name', 'Typ', 'Wert', 'Statisch'))
+}
+#
+function Show-NetDnsRecord {
+    if (-not (Test-NetDnsReady)) { return }
+    $z = Select-NetDnsZone -Art Alle -Titel 'Eintraege welcher Zone anzeigen?'
+    if (-not $z) { return }
+    $liste = @(Get-NetDnsRecord -Zone $z.Name)
+    Write-NetTitle -Titel ('Eintraege in {0} ({1})' -f $z.Name, $liste.Count)
+    foreach ($e in ($liste | Sort-Object -Property Typ, Name)) {
+        $alter = 'statisch'
+        if (-not $e.Statisch) { $alter = 'dynamisch ' + $e.Zeitstempel.ToString('yyyy-MM-dd') }
+        Write-Host ('  {0,-30} {1,-6} {2,-40} {3}' -f $e.Name, $e.Typ, $e.Wert, $alter)
+    }
+}
+#
+function Find-NetDnsRecord {
+    <#
+    .SYNOPSIS
+        Sucht einen Namen oder eine Adresse in allen Zonen.
+    #>
+    param([string]$Suche)
+    if (-not (Test-NetDnsReady)) { return }
+    if (-not $Suche) { $Suche = Read-NetText -Frage 'Suchbegriff (Teil eines Namens oder einer Adresse)' }
+    if (-not $Suche) { return }
+    $treffer = @()
+    foreach ($z in @(Get-NetDnsZoneInfo | Where-Object { $_.Typ -ne 'Forwarder' })) {
+        $treffer += @(Get-NetDnsRecord -Zone $z.Name | Where-Object { $_.Name -like "*$Suche*" -or $_.Wert -like "*$Suche*" })
+    }
+    Write-NetTitle -Titel ("Suche nach '{0}': {1} Treffer" -f $Suche, $treffer.Count)
+    foreach ($e in $treffer) { Write-Host ('  {0,-28} {1,-25} {2,-6} {3}' -f $e.Zone, $e.Name, $e.Typ, $e.Wert) }
+    return $treffer
+}
+#
+function Remove-NetDnsRecord {
+    <#
+    .SYNOPSIS
+        Loescht einen gewaehlten Eintrag (Gegenaktion: wieder anlegen).
+    #>
+    param([object]$Eintrag)
+    if (-not (Test-NetDnsReady)) { return $false }
+    if (-not $Eintrag) { $Eintrag = Select-NetDnsRecord -Titel 'Welchen Eintrag loeschen?' }
+    if (-not $Eintrag) { return $false }
+    if ($script:NetDnsTypen -notcontains $Eintrag.Typ) { Write-Log -Level Warn -Message 'Dieser Eintragstyp wird von Windows verwaltet und hier nicht geloescht.'; return $false }
+    $zoneName = $Eintrag.Zone
+    $eintragName = $Eintrag.Name
+    $eintragTyp = $Eintrag.Typ
+    $eintragDaten = $Eintrag.Daten
+    $r = Invoke-NetChange -Titel ('DNS-Eintrag {0} ({1}) aus {2} loeschen' -f $eintragName, $eintragTyp, $zoneName) -Stufe Bestaetigen -Vorher ('{0} {1} {2}' -f $eintragName, $eintragTyp, $Eintrag.Wert) -Nachher '(geloescht)' -BackupBereich @('Dns') -Aktion {
+        Remove-NetDnsRecordExact -ZoneName $zoneName -Name $eintragName -Typ $eintragTyp -Daten $eintragDaten
+    } -Rueckgaengig @{ Befehl = 'Add-NetDnsRecordExact'; Parameter = @{ ZoneName = $zoneName; Name = $eintragName; Typ = $eintragTyp; Daten = $eintragDaten } }
+    return [bool]($r.Erfolg -and -not $r.Probelauf)
+}
+#
+function Edit-NetDnsRecord {
+    <#
+    .SYNOPSIS
+        Aendert die Daten eines Eintrags (alter Eintrag wird ersetzt, Gegenaktion stellt ihn wieder her).
+    #>
+    if (-not (Test-NetDnsReady)) { return $false }
+    $alt = Select-NetDnsRecord -Titel 'Welchen Eintrag aendern?'
+    if (-not $alt) { return $false }
+    if ($script:NetDnsTypen -notcontains $alt.Typ) { Write-Log -Level Warn -Message 'Dieser Eintragstyp wird von Windows verwaltet und hier nicht geaendert.'; return $false }
+    $neu = Read-NetDnsRecordData -Typ $alt.Typ -Vorschlag $alt.Daten
+    if (-not $neu) { return $false }
+    if (Test-NetDnsRecordEqual -A $neu -B $alt.Daten) { Write-Log -Level OK -Message 'Keine Aenderung.'; return $true }
+    $zoneName = $alt.Zone
+    $eintragName = $alt.Name
+    $eintragTyp = $alt.Typ
+    $altDaten = $alt.Daten
+    $neuDaten = $neu
+    $r = Invoke-NetChange -Titel ('DNS-Eintrag {0} ({1}) in {2} aendern' -f $eintragName, $eintragTyp, $zoneName) -Stufe Bestaetigen -Vorher $altDaten -Nachher $neuDaten -BackupBereich @('Dns') -Aktion {
+        Add-NetDnsRecordExact -ZoneName $zoneName -Name $eintragName -Typ $eintragTyp -Daten $neuDaten
+        Remove-NetDnsRecordExact -ZoneName $zoneName -Name $eintragName -Typ $eintragTyp -Daten $altDaten
+    } -Rueckgaengig @(
+        @{ Befehl = 'Add-NetDnsRecordExact'; Parameter = @{ ZoneName = $zoneName; Name = $eintragName; Typ = $eintragTyp; Daten = $altDaten } },
+        @{ Befehl = 'Remove-NetDnsRecordExact'; Parameter = @{ ZoneName = $zoneName; Name = $eintragName; Typ = $eintragTyp; Daten = $neuDaten } }
+    )
+    return [bool]($r.Erfolg -and -not $r.Probelauf)
+}
+# ----------------------------------------------------------------------
+# src/dns/DnsWeiterleitung.ps1
+# ----------------------------------------------------------------------
+# Weiterleitungen (Forwarder) und bedingte Weiterleitungen. Erreichbarkeit wird mit
+# Resolve-DnsName -Server getestet; ohne Internet gibt es nur eine Warnung.
+#
+$script:NetWeiterleitungHilfe = @'
+Weiterleitung oder Stammhinweise?
+  - Weiterleitung (Forwarder): Der DNS-Server fragt fuer alle fremden Namen einen bestimmten
+    anderen DNS-Server, z. B. Quad9 (9.9.9.9, filtert Schadseiten), Cloudflare (1.1.1.1)
+    oder den Router. Schnell und einfach; ueblich in kleinen und mittleren Netzen.
+  - Stammhinweise (Root Hints): Ohne Weiterleitung fragt der DNS-Server selbst bei den
+    Stammservern des Internets nach und hangelt sich durch. Braucht freien Zugang ueber Port 53.
+  - Bedingte Weiterleitung: gilt nur fuer eine bestimmte Domaene, z. B. partner.local -> 10.1.1.10.
+Wichtig: Clients und Mitgliedsserver fragen immer die DCs, nie direkt 8.8.8.8 o. ae.
+'@
+#
+function Get-NetDnsForwarderList {
+    $fw = Get-NetSafe -Beschreibung 'Get-DnsServerForwarder' -Abfrage { Get-DnsServerForwarder }
+    if (-not $fw) { return @() }
+    return @($fw.IPAddress | Where-Object { $_ } | ForEach-Object { ConvertTo-NetString -Wert $_ })
+}
+#
+function Test-NetDnsForwarder {
+    <#
+    .SYNOPSIS
+        Prueft, ob ein DNS-Server antwortet (Abfrage der Stammzone). Liefert $true/$false.
+    #>
+    param([Parameter(Mandatory = $true)][string]$Server)
+    $antwort = Get-NetSafe -Beschreibung "Weiterleitung $Server" -Abfrage { Resolve-DnsName -Name '.' -Type NS -Server $Server -DnsOnly -QuickTimeout }
+    return [bool]$antwort
+}
+#
+function Show-NetDnsForwarder {
+    if (-not (Test-NetDnsReady)) { return }
+    Write-NetTitle -Titel 'Weiterleitungen'
+    $liste = @(Get-NetDnsForwarderList)
+    if ($liste.Count -eq 0) { Write-Log -Message 'Keine Weiterleitung eingestellt: der Server verwendet die Stammhinweise.' }
+    foreach ($ip in $liste) {
+        if (Test-NetDnsForwarder -Server $ip) { Write-NetStatus -Status OK -Bereich $ip -Text 'antwortet' }
+        else { Write-NetStatus -Status WARN -Bereich $ip -Text 'antwortet nicht (ohne Internet normal)' }
+    }
+    $bedingt = @(Get-NetDnsZoneInfo | Where-Object { $_.Typ -eq 'Forwarder' })
+    if ($bedingt.Count -gt 0) {
+        Write-Host '  Bedingte Weiterleitungen:'
+        foreach ($b in $bedingt) { Write-Host ('    {0}' -f $b.Name) }
+    }
+}
+#
+function Set-NetDnsForwarder {
+    <#
+    .SYNOPSIS
+        Setzt die Weiterleitungen (Vorschlaege: Quad9, Cloudflare, Router oder eigene).
+    #>
+    param([string[]]$Adressen)
+    if (-not (Test-NetDnsReady)) { return $false }
+    $alt = @(Get-NetDnsForwarderList)
+    if (-not $Adressen) {
+        Write-NetText -Text $script:NetWeiterleitungHilfe
+        $router = ''
+        $z = Get-NetSetupState
+        $karte = @($z.Netzwerk.AktiveKarten) | Select-Object -First 1
+        if ($karte -and $karte.Gateway.Count -gt 0) { $router = $karte.Gateway[0] }
+        $vorschlag = @(Get-NetConfigValue -Pfad 'Vorschlaege.Weiterleitungen' -Standard @('9.9.9.9', '1.1.1.1'))
+        $optionen = @(
+            ('Vorschlag aus den Einstellungen: ' + ($vorschlag -join ', ')),
+            'Quad9: 9.9.9.9 und 149.112.112.112 (filtert bekannte Schadseiten)',
+            'Cloudflare: 1.1.1.1 und 1.0.0.1')
+        if ($router) { $optionen += ('Router: ' + $router) }
+        $optionen += 'Eigene Adressen eingeben'
+        $optionen += 'Alle Weiterleitungen entfernen (Stammhinweise verwenden)'
+        $i = Read-NetChoice -Frage ('Weiterleitungen (aktuell: {0})' -f $(if ($alt.Count) { $alt -join ', ' } else { 'keine' })) -Optionen $optionen -Vorschlag 1
+        if ($i -lt 0) { return $false }
+        $text = $optionen[$i]
+        if ($text -like 'Vorschlag*') { $Adressen = $vorschlag }
+        elseif ($text -like 'Quad9*') { $Adressen = @('9.9.9.9', '149.112.112.112') }
+        elseif ($text -like 'Cloudflare*') { $Adressen = @('1.1.1.1', '1.0.0.1') }
+        elseif ($text -like 'Router*') { $Adressen = @($router) }
+        elseif ($text -like 'Alle*') { $Adressen = @() }
+        else {
+            $eingabe = Read-NetText -Frage 'DNS-Server (mit Komma getrennt)' -Pruefung {
+                param($t)
+                foreach ($x in $t.Split(',')) { if (-not (Test-NetIPv4Address -Text $x.Trim())) { return "'$x' ist keine gueltige IPv4-Adresse." } }
+                return $null
+            }
+            if (-not $eingabe) { return $false }
+            $Adressen = @($eingabe.Split(',') | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+        }
+    }
+    $neu = @($Adressen)
+    if (($alt -join ',') -eq ($neu -join ',')) { Write-Log -Level OK -Message 'Die Weiterleitungen sind bereits so eingestellt.'; return $true }
+    foreach ($ip in $neu) {
+        if (Test-NetDnsForwarder -Server $ip) { Write-NetStatus -Status OK -Bereich $ip -Text 'antwortet' }
+        else { Write-NetStatus -Status WARN -Bereich $ip -Text 'antwortet nicht - ohne Internetzugang ist das normal, die Einstellung kann trotzdem gesetzt werden' }
+    }
+    if ($neu.Count -eq 0) {
+        $r = Invoke-NetChange -Titel 'Alle Weiterleitungen entfernen' -Stufe Bestaetigen -Vorher ($alt -join ', ') -Nachher '(Stammhinweise)' -BackupBereich @('Dns') -Aktion {
+            Remove-DnsServerForwarder -IPAddress $alt -Force
+        } -Rueckgaengig @{ Befehl = 'Set-DnsServerForwarder'; Parameter = @{ IPAddress = $alt } }
+    }
+    else {
+        $rueck = @{ Befehl = 'Set-DnsServerForwarder'; Parameter = @{ IPAddress = $alt } }
+        if ($alt.Count -eq 0) { $rueck = @{ Befehl = 'Remove-DnsServerForwarder'; Parameter = @{ IPAddress = $neu; Force = $true } } }
+        $r = Invoke-NetChange -Titel 'Weiterleitungen setzen' -Stufe Bestaetigen -Vorher $(if ($alt.Count) { $alt -join ', ' } else { '(keine - Stammhinweise)' }) -Nachher ($neu -join ', ') -BackupBereich @('Dns') -Aktion {
+            Set-DnsServerForwarder -IPAddress $neu
+        } -Rueckgaengig $rueck
+    }
+    return [bool]($r.Erfolg -and -not $r.Probelauf)
+}
+#
+function Add-NetDnsConditionalForwarder {
+    if (-not (Test-NetDnsReady)) { return $false }
+    Write-NetText -Text 'Bedingte Weiterleitung: Anfragen fuer eine bestimmte Domaene gehen an bestimmte DNS-Server (z. B. Partnerfirma, zweite Gesamtstruktur).'
+    $name = Read-NetText -Frage 'Domaene (z. B. partner.local)' -Pruefung { param($t) if ($t -match '^[A-Za-z0-9.-]+$' -and $t.Contains('.')) { $null } else { 'Bitte einen Domaenennamen wie partner.local eingeben.' } }
+    if (-not $name) { return $false }
+    $name = $name.ToLower().TrimEnd('.')
+    if (Get-NetSafe -Beschreibung "Zone $name" -Abfrage { Get-DnsServerZone -Name $name }) {
+        Write-Log -Level Warn -Message "Fuer $name gibt es bereits eine Zone oder Weiterleitung. Nichts zu tun."
+        return $true
+    }
+    $text = Read-NetText -Frage 'DNS-Server dieser Domaene (mit Komma getrennt)' -Pruefung {
+        param($t)
+        foreach ($x in $t.Split(',')) { if (-not (Test-NetIPv4Address -Text $x.Trim())) { return "'$x' ist keine gueltige IPv4-Adresse." } }
+        return $null
+    }
+    if (-not $text) { return $false }
+    $server = @($text.Split(',') | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    foreach ($ip in $server) {
+        if (-not (Test-NetDnsForwarder -Server $ip)) { Write-Log -Level Warn -Message "$ip antwortet nicht. Die Weiterleitung wird trotzdem angelegt." }
+    }
+    $p = @{ Name = $name; MasterServers = $server }
+    if (Test-NetIsDomainController) { $p.ReplicationScope = 'Domain' }
+    $r = Invoke-NetChange -Titel "Bedingte Weiterleitung fuer $name anlegen" -Stufe Bestaetigen -Vorher '(keine)' -Nachher @{ Domaene = $name; Server = ($server -join ', ') } -BackupBereich @('Dns') -Aktion {
+        Add-DnsServerConditionalForwarderZone @p
+    } -Rueckgaengig @{ Befehl = 'Remove-DnsServerZone'; Parameter = @{ Name = $name; Force = $true } }
+    return [bool]($r.Erfolg -and -not $r.Probelauf)
+}
+#
+function Remove-NetDnsConditionalForwarder {
+    if (-not (Test-NetDnsReady)) { return }
+    $liste = @(Get-NetDnsZoneInfo | Where-Object { $_.Typ -eq 'Forwarder' })
+    $z = Select-NetItem -Elemente $liste -Titel 'Welche bedingte Weiterleitung entfernen?' -Eigenschaften @('Name', 'Replikation')
+    if (-not $z) { return }
+    $name = $z.Name
+    Invoke-NetChange -Titel "Bedingte Weiterleitung $name entfernen" -Stufe Gefaehrlich -Vorher $name -Nachher '(entfernt)' -BackupBereich @('Dns') -Aktion {
+        Remove-DnsServerZone -Name $name -Force
+    } | Out-Null
+}
+#
+function Show-NetDnsForwarderMenu {
+    $eintraege = @(
+        @{ Text = 'Weiterleitungen anzeigen und testen'; Aktion = 'Show-NetDnsForwarder'; Hilfe = 'Zeigt die Weiterleitungen und prueft, ob sie antworten. Ohne Internet antworten externe Server nicht - das ist dann normal.' },
+        @{ Text = 'Weiterleitungen setzen'; Aktion = { Set-NetDnsForwarder | Out-Null }; Hilfe = "Vorschlaege: Quad9 (9.9.9.9), Cloudflare (1.1.1.1) oder der Router.`nVorher/Nachher wird angezeigt, die alte Einstellung kann rueckgaengig gemacht werden." },
+        @{ Text = 'Bedingte Weiterleitung anlegen'; Aktion = { Add-NetDnsConditionalForwarder | Out-Null }; Hilfe = 'Nur fuer eine bestimmte Domaene an bestimmte DNS-Server weiterleiten (z. B. Partnerfirma).' },
+        @{ Text = 'Bedingte Weiterleitung entfernen'; Aktion = 'Remove-NetDnsConditionalForwarder'; Hilfe = 'Entfernt eine bedingte Weiterleitung (gefaehrlich: vorher Backup, Servername eintippen).' },
+        @{ Text = 'Erklaerung: Weiterleitung oder Stammhinweise?'; Aktion = { Write-NetText -Text $script:NetWeiterleitungHilfe }; Hilfe = 'Erklaert den Unterschied zwischen Weiterleitung, Stammhinweisen und bedingter Weiterleitung.' }
+    )
+    Show-NetMenu -Titel 'DNS - Weiterleitungen' -Eintraege $eintraege -Einleitung $script:NetWeiterleitungHilfe
+}
+# ----------------------------------------------------------------------
+# src/dns/DnsAging.ps1
+# ----------------------------------------------------------------------
+# Aging und Scavenging: alte, dynamisch eingetragene DNS-Eintraege automatisch entfernen.
+# Assistent mit Vorschlag "an, 7 + 7 Tage" und Modus "nur melden" (veraltete Eintraege auflisten).
+#
+$script:NetAgingHilfe = @'
+Aging/Scavenging raeumt alte, automatisch eingetragene DNS-Eintraege auf (z. B. von Laptops,
+die laengst weg sind). Statische Eintraege werden nie geloescht.
+  - No-Refresh-Intervall: so lange wird ein frischer Eintrag nicht erneut gestempelt.
+  - Refresh-Intervall: danach darf der Client ihn erneuern. Wer in No-Refresh + Refresh nicht
+    erneuert, gilt als veraltet und wird beim naechsten Aufraeumen geloescht.
+  - Vorschlag: an, 7 + 7 Tage, Aufraeumen alle 7 Tage.
+  - Wichtig: No-Refresh + Refresh muss mindestens so lang sein wie die DHCP-Lease-Dauer,
+    sonst werden Eintraege aktiver Clients geloescht. Bei 8 Tagen Lease passen 7 + 7 Tage.
+  - "Nur melden" zeigt, was geloescht wuerde, ohne etwas zu loeschen.
+'@
+#
+function ConvertTo-NetTimeSpan {
+    param([AllowNull()][object]$Wert)
+    if ($null -eq $Wert) { return [TimeSpan]::Zero }
+    if ($Wert -is [TimeSpan]) { return $Wert }
+    $ts = [TimeSpan]::Zero
+    if ([TimeSpan]::TryParse([string]$Wert, [ref]$ts)) { return $ts }
+    return [TimeSpan]::Zero
+}
+#
+function Get-NetMaxLeaseDuration {
+    param([hashtable]$Zustand = $script:NS.Zustand)
+    $max = 0
+    if ($Zustand -and $Zustand.Dhcp) {
+        foreach ($s in @($Zustand.Dhcp.Scopes)) { if ($s.LeaseTage -gt $max) { $max = [double]$s.LeaseTage } }
+    }
+    return $max
+}
+#
+function Show-NetDnsAging {
+    if (-not (Test-NetDnsReady)) { return }
+    Write-NetTitle -Titel 'Aging und Scavenging'
+    $sc = Get-NetSafe -Beschreibung 'Get-DnsServerScavenging' -Abfrage { Get-DnsServerScavenging }
+    if ($sc) {
+        Write-Host ('  Server: Aufraeumen {0}, alle {1} Tage, No-Refresh {2} Tage, Refresh {3} Tage' -f $(if ($sc.ScavengingState) { 'AN' } else { 'aus' }), (ConvertTo-NetTimeSpan $sc.ScavengingInterval).TotalDays, (ConvertTo-NetTimeSpan $sc.NoRefreshInterval).TotalDays, (ConvertTo-NetTimeSpan $sc.RefreshInterval).TotalDays)
+        if ($sc.LastScavengeTime) { Write-Host ('  Zuletzt aufgeraeumt: {0}' -f $sc.LastScavengeTime) }
+    }
+    foreach ($z in @(Get-NetDnsZoneInfo -Art Primaer)) {
+        $name = $z.Name
+        $a = Get-NetSafe -Beschreibung "Aging $name" -Abfrage { Get-DnsServerZoneAging -Name $name }
+        if ($a) { Write-Host ('  Zone {0,-35} Aging {1,-4} No-Refresh {2,4} Tage, Refresh {3,4} Tage' -f $name, $(if ($a.AgingEnabled) { 'an' } else { 'aus' }), (ConvertTo-NetTimeSpan $a.NoRefreshInterval).TotalDays, (ConvertTo-NetTimeSpan $a.RefreshInterval).TotalDays) }
+    }
+    $lease = Get-NetMaxLeaseDuration -Zustand (Get-NetSetupState)
+    if ($lease -gt 0 -and $sc -and ((ConvertTo-NetTimeSpan $sc.NoRefreshInterval).TotalDays + (ConvertTo-NetTimeSpan $sc.RefreshInterval).TotalDays) -lt $lease) {
+        Write-Log -Level Warn -Message ('No-Refresh + Refresh ist kuerzer als die laengste Lease-Dauer ({0} Tage).' -f $lease)
+    }
+}
+#
+function Get-NetStaleDnsRecord {
+    <#
+    .SYNOPSIS
+        Listet veraltete dynamische Eintraege (aelter als No-Refresh + Refresh), ohne etwas zu loeschen.
+    #>
+    param([int]$NoRefreshTage = 7, [int]$RefreshTage = 7)
+    $grenze = (Get-Date).AddDays( - ($NoRefreshTage + $RefreshTage))
+    $liste = @()
+    foreach ($z in @(Get-NetDnsZoneInfo -Art Primaer)) {
+        $liste += @(Get-NetDnsRecord -Zone $z.Name | Where-Object { -not $_.Statisch -and $_.Zeitstempel -lt $grenze -and @('A', 'AAAA', 'PTR', 'CNAME') -contains $_.Typ })
+    }
+    return $liste
+}
+#
+function Show-NetStaleDnsRecord {
+    <#
+    .SYNOPSIS
+        Modus "nur melden": zeigt veraltete Eintraege und speichert sie als CSV im Ordner Berichte.
+    #>
+    if (-not (Test-NetDnsReady)) { return }
+    $nr = [int](Get-NetConfigValue -Pfad 'Vorschlaege.NoRefreshTage' -Standard 7)
+    $rf = [int](Get-NetConfigValue -Pfad 'Vorschlaege.RefreshTage' -Standard 7)
+    $liste = @(Get-NetStaleDnsRecord -NoRefreshTage $nr -RefreshTage $rf)
+    Write-NetTitle -Titel ('Veraltete Eintraege (aelter als {0} Tage) - es wird nichts geloescht' -f ($nr + $rf))
+    if ($liste.Count -eq 0) { Write-Log -Level OK -Message 'Keine veralteten dynamischen Eintraege gefunden.'; return }
+    foreach ($e in $liste) { Write-Host ('  {0,-28} {1,-25} {2,-6} {3,-18} zuletzt {4}' -f $e.Zone, $e.Name, $e.Typ, $e.Wert, $e.Zeitstempel.ToString('yyyy-MM-dd')) }
+    $datei = Join-Path -Path (Get-NetPath -Name Berichte) -ChildPath ('DNS_veraltet_{0}.csv' -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
+    try {
+        $liste | Select-Object -Property Zone, Name, Typ, Wert, Zeitstempel | Export-Csv -Path $datei -NoTypeInformation -Encoding UTF8 -Delimiter ';'
+        Write-Log -Level OK -Message ('{0} veraltete Eintraege, Liste gespeichert: {1}' -f $liste.Count, $datei)
+    }
+    catch { Write-NetError -Fehler $_ -Titel 'Liste speichern' | Out-Null }
+}
+#
+function Set-NetDnsScavenging {
+    <#
+    .SYNOPSIS
+        Assistent: Aging/Scavenging auf Server- und Zonenebene einstellen.
+    #>
+    param([Nullable[bool]]$Aktiv = $null, [int]$NoRefreshTage = 0, [int]$RefreshTage = 0)
+    if (-not (Test-NetDnsReady)) { return $false }
+    if ($null -eq $Aktiv) {
+        Write-NetText -Text $script:NetAgingHilfe
+        $i = Read-NetChoice -Frage 'Was soll passieren?' -Optionen @(
+            'Aufraeumen einschalten (Server und alle Zonen) - Vorschlag',
+            'Nur melden: veraltete Eintraege auflisten, nichts loeschen',
+            'Aufraeumen ausschalten') -Vorschlag 1
+        if ($i -lt 0) { return $false }
+        if ($i -eq 1) { Show-NetStaleDnsRecord; return $true }
+        $Aktiv = ($i -eq 0)
+    }
+    $vorNr = [int](Get-NetConfigValue -Pfad 'Vorschlaege.NoRefreshTage' -Standard 7)
+    $vorRf = [int](Get-NetConfigValue -Pfad 'Vorschlaege.RefreshTage' -Standard 7)
+    if ($Aktiv -and $NoRefreshTage -le 0) {
+        $NoRefreshTage = Read-NetNumber -Frage 'No-Refresh-Intervall in Tagen' -Minimum 1 -Maximum 365 -Vorschlag $vorNr
+        if ($null -eq $NoRefreshTage) { return $false }
+        $RefreshTage = Read-NetNumber -Frage 'Refresh-Intervall in Tagen' -Minimum 1 -Maximum 365 -Vorschlag $vorRf
+        if ($null -eq $RefreshTage) { return $false }
+    }
+    if ($NoRefreshTage -le 0) { $NoRefreshTage = $vorNr }
+    if ($RefreshTage -le 0) { $RefreshTage = $vorRf }
+    $lease = Get-NetMaxLeaseDuration -Zustand (Get-NetSetupState)
+    if ($Aktiv -and $lease -gt 0 -and ($NoRefreshTage + $RefreshTage) -lt $lease) {
+        Write-Log -Level Warn -Message ('No-Refresh + Refresh ({0} Tage) ist kuerzer als die Lease-Dauer ({1} Tage). Dann wuerden Eintraege aktiver Clients geloescht.' -f ($NoRefreshTage + $RefreshTage), $lease)
+        if (-not (Read-NetYesNo -Frage 'Trotzdem so einstellen?' -Vorschlag $false)) { return $false }
+    }
+    $alt = Get-NetSafe -Beschreibung 'Get-DnsServerScavenging' -Abfrage { Get-DnsServerScavenging }
+    $altZustand = @{ Aktiv = $false; Intervall = '7.00:00:00'; NoRefresh = '7.00:00:00'; Refresh = '7.00:00:00' }
+    if ($alt) {
+        $altZustand = @{ Aktiv = [bool]$alt.ScavengingState; Intervall = (ConvertTo-NetTimeSpan $alt.ScavengingInterval).ToString(); NoRefresh = (ConvertTo-NetTimeSpan $alt.NoRefreshInterval).ToString(); Refresh = (ConvertTo-NetTimeSpan $alt.RefreshInterval).ToString() }
+    }
+    $nr = [TimeSpan]::FromDays($NoRefreshTage)
+    $rf = [TimeSpan]::FromDays($RefreshTage)
+    $intervall = [TimeSpan]::FromDays(7)
+    $neuAktiv = [bool]$Aktiv
+    if ($altZustand.Aktiv -eq $neuAktiv -and $altZustand.NoRefresh -eq $nr.ToString() -and $altZustand.Refresh -eq $rf.ToString() -and (-not $neuAktiv -or $altZustand.Intervall -eq $intervall.ToString())) {
+        Write-Log -Level OK -Message 'Aging/Scavenging ist bereits so eingestellt.'
+        return $true
+    }
+    $zonen = @(Get-NetDnsZoneInfo -Art Primaer | Where-Object { $_.Updates -ne 'None' } | ForEach-Object { $_.Name })
+    $r = Invoke-NetChange -Titel ('Aging/Scavenging {0}' -f $(if ($neuAktiv) { 'einschalten' } else { 'ausschalten' })) -Stufe Bestaetigen `
+        -Vorher @{ Aufraeumen = $(if ($altZustand.Aktiv) { 'an' } else { 'aus' }); 'No-Refresh' = $altZustand.NoRefresh; Refresh = $altZustand.Refresh } `
+        -Nachher @{ Aufraeumen = $(if ($neuAktiv) { 'an, alle 7 Tage' } else { 'aus' }); 'No-Refresh' = $nr.ToString(); Refresh = $rf.ToString(); Zonen = ($zonen -join ', ') } -BackupBereich @('Dns') -Aktion {
+        if ($neuAktiv) {
+            Set-DnsServerScavenging -ScavengingState $true -ScavengingInterval $intervall -NoRefreshInterval $nr -RefreshInterval $rf -ApplyOnAllZones
+            foreach ($zone in $zonen) { Set-DnsServerZoneAging -Name $zone -Aging $true -NoRefreshInterval $nr -RefreshInterval $rf }
+        }
+        else {
+            Set-DnsServerScavenging -ScavengingState $false
+        }
+    } -Rueckgaengig @{ Befehl = 'Set-DnsServerScavenging'; Parameter = @{ ScavengingState = $altZustand.Aktiv; ScavengingInterval = $altZustand.Intervall; NoRefreshInterval = $altZustand.NoRefresh; RefreshInterval = $altZustand.Refresh } }
+    return [bool]($r.Erfolg -and -not $r.Probelauf)
+}
+#
+function Set-NetDnsZoneAgingOne {
+    <#
+    .SYNOPSIS
+        Aging fuer eine einzelne Zone ein- oder ausschalten.
+    #>
+    if (-not (Test-NetDnsReady)) { return }
+    $z = Select-NetDnsZone -Art Primaer -Titel 'Aging fuer welche Zone?'
+    if (-not $z) { return }
+    $name = $z.Name
+    $alt = Get-NetSafe -Beschreibung "Aging $name" -Abfrage { Get-DnsServerZoneAging -Name $name }
+    $altAn = $false
+    if ($alt) { $altAn = [bool]$alt.AgingEnabled }
+    $an = Read-NetYesNo -Frage ("Aging fuer {0} einschalten? (aktuell {1})" -f $name, $(if ($altAn) { 'an' } else { 'aus' })) -Vorschlag $true
+    if ($an -eq $altAn) { Write-Log -Level OK -Message 'Keine Aenderung noetig.'; return }
+    $nr = [TimeSpan]::FromDays([int](Get-NetConfigValue -Pfad 'Vorschlaege.NoRefreshTage' -Standard 7))
+    $rf = [TimeSpan]::FromDays([int](Get-NetConfigValue -Pfad 'Vorschlaege.RefreshTage' -Standard 7))
+    Invoke-NetChange -Titel "Aging der Zone $name $(if ($an) { 'einschalten' } else { 'ausschalten' })" -Stufe Bestaetigen -Vorher $(if ($altAn) { 'an' } else { 'aus' }) -Nachher $(if ($an) { 'an' } else { 'aus' }) -BackupBereich @('Dns') -Aktion {
+        if ($an) { Set-DnsServerZoneAging -Name $name -Aging $true -NoRefreshInterval $nr -RefreshInterval $rf }
+        else { Set-DnsServerZoneAging -Name $name -Aging $false }
+    } -Rueckgaengig @{ Befehl = 'Set-DnsServerZoneAging'; Parameter = @{ Name = $name; Aging = $altAn } } | Out-Null
+}
+#
+function Show-NetDnsAgingMenu {
+    $eintraege = @(
+        @{ Text = 'Einstellungen anzeigen'; Aktion = 'Show-NetDnsAging'; Hilfe = 'Zeigt Aging/Scavenging auf Server- und Zonenebene und vergleicht mit der DHCP-Lease-Dauer.' },
+        @{ Text = 'Assistent (Vorschlag: an, 7 + 7 Tage)'; Aktion = { Set-NetDnsScavenging | Out-Null }; Hilfe = $script:NetAgingHilfe },
+        @{ Text = 'Nur melden: veraltete Eintraege auflisten'; Aktion = 'Show-NetStaleDnsRecord'; Hilfe = 'Zeigt, welche dynamischen Eintraege beim Aufraeumen geloescht wuerden, und speichert die Liste als CSV. Es wird nichts geloescht.' },
+        @{ Text = 'Aging einer einzelnen Zone'; Aktion = 'Set-NetDnsZoneAgingOne'; Hilfe = 'Schaltet Aging nur fuer eine Zone ein oder aus.' }
+    )
+    Show-NetMenu -Titel 'DNS - Aufraeumen alter Eintraege' -Eintraege $eintraege -Einleitung $script:NetAgingHilfe
+}
+# ----------------------------------------------------------------------
+# src/dns/DnsMenue.ps1
+# ----------------------------------------------------------------------
+# DNS: Abhoer-IP-Adressen, Uebersicht, Einrichtungs-Assistent und Menue.
+#
+function Get-NetDnsListenAddress {
+    $s = Get-NetSafe -Beschreibung 'Get-DnsServerSetting' -Abfrage { Get-DnsServerSetting -All }
+    if (-not $s -or -not $s.ListeningIPAddress) { return @() }
+    return @($s.ListeningIPAddress | ForEach-Object { ConvertTo-NetString -Wert $_ })
+}
+#
+function Set-NetDnsListenAddress {
+    <#
+    .SYNOPSIS
+        Setzt die Abhoer-IP-Adressen (leer = alle). Wird auch als Gegenaktion verwendet.
+    #>
+    param([AllowEmptyCollection()][string[]]$Adressen = @())
+    $s = Get-DnsServerSetting -All
+    $s.ListeningIPAddress = @($Adressen)
+    Set-DnsServerSetting -InputObject $s
+}
+#
+function Edit-NetDnsListenAddress {
+    <#
+    .SYNOPSIS
+        Prueft und stellt ein, auf welchen Adressen der DNS-Server antwortet.
+    #>
+    if (-not (Test-NetDnsReady)) { return }
+    $z = Get-NetSetupState
+    $eigene = @($z.Netzwerk.EigeneIPs)
+    $alt = @(Get-NetDnsListenAddress)
+    Write-NetTitle -Titel 'Abhoer-IP-Adressen des DNS-Servers'
+    if ($alt.Count -eq 0) { Write-Log -Message 'Der DNS-Server antwortet auf allen Adressen des Servers (Standard).' }
+    else { Write-Log -Message ('Der DNS-Server antwortet nur auf: ' + ($alt -join ', ')) }
+    $fremd = @($alt | Where-Object { $eigene -notcontains $_ -and $_ -notmatch ':' })
+    if ($fremd.Count -gt 0) { Write-Log -Level Warn -Message ('Diese Adressen gibt es auf dem Server nicht (mehr): ' + ($fremd -join ', ')) }
+    if (@($alt | Where-Object { $_ -like '169.254.*' }).Count -gt 0) { Write-Log -Level Warn -Message 'Eine APIPA-Adresse (169.254.x.x) ist eingetragen. Das deutet auf eine falsch konfigurierte Netzwerkkarte hin.' }
+    $i = Read-NetChoice -Frage 'Einstellung' -Optionen @('Alle Adressen des Servers (empfohlen)', 'Nur bestimmte Adressen waehlen', 'Nichts aendern') -Vorschlag 3
+    if ($i -lt 0 -or $i -eq 2) { return }
+    $neu = @()
+    if ($i -eq 1) {
+        $wahl = @(Select-NetItem -Elemente $eigene -Titel 'Auf welchen Adressen soll DNS antworten?' -Mehrfach)
+        if ($wahl.Count -eq 0) { return }
+        $neu = @($wahl | ForEach-Object { [string]$_ })
+    }
+    if (($alt -join ',') -eq ($neu -join ',')) { Write-Log -Level OK -Message 'Bereits so eingestellt.'; return }
+    Invoke-NetChange -Titel 'Abhoer-IP-Adressen des DNS-Servers einstellen' -Stufe Bestaetigen -Vorher $(if ($alt.Count) { $alt -join ', ' } else { 'alle' }) -Nachher $(if ($neu.Count) { $neu -join ', ' } else { 'alle' }) -BackupBereich @('Dns') -Aktion {
+        Set-NetDnsListenAddress -Adressen $neu
+    } -Rueckgaengig @{ Befehl = 'Set-NetDnsListenAddress'; Parameter = @{ Adressen = $alt } } | Out-Null
+}
+#
+function Show-NetDnsOverview {
+    if (-not (Test-NetDnsReady)) { return }
+    Show-NetDnsZone
+    Write-Host ''
+    $fw = @(Get-NetDnsForwarderList)
+    Write-Host ('  Weiterleitungen : {0}' -f $(if ($fw.Count) { $fw -join ', ' } else { 'keine (Stammhinweise)' }))
+    $sc = Get-NetSafe -Beschreibung 'Scavenging' -Abfrage { Get-DnsServerScavenging }
+    if ($sc) { Write-Host ('  Aufraeumen      : {0}' -f $(if ($sc.ScavengingState) { 'an' } else { 'aus' })) }
+    $abh = @(Get-NetDnsListenAddress)
+    Write-Host ('  Abhoer-Adressen : {0}' -f $(if ($abh.Count) { $abh -join ', ' } else { 'alle' }))
+    $fehlend = @(Get-NetMissingReverseZone)
+    if ($fehlend.Count -gt 0) { Write-Log -Level Warn -Message ('Fehlende Reverse-Zonen: ' + (($fehlend | ForEach-Object { $_.Zone }) -join ', ')) }
+}
+#
+function Start-NetDnsSetup {
+    <#
+    .SYNOPSIS
+        Assistent: DNS einrichten (Rolle, Forward-Zone, Reverse-Zonen, Weiterleitungen, Aufraeumen).
+        Ueberspringt alles, was schon passt.
+    #>
+    Write-NetTitle -Titel 'DNS einrichten'
+    if (-not (Test-NetDnsReady)) { return }
+    $z = Get-NetSetupState
+    $forward = @($z.Dns.Zonen | Where-Object { -not $_.Reverse -and $_.Typ -eq 'Primary' -and $_.Name -notlike '_msdcs.*' })
+    if ($forward.Count -eq 0) {
+        Write-Log -Level Warn -Message 'Es gibt noch keine Forward-Zone.'
+        if (Read-NetYesNo -Frage 'Jetzt eine Forward-Zone anlegen?' -Vorschlag $true) { New-NetDnsForwardZone }
+    }
+    else { Write-Log -Level OK -Message ('Forward-Zone(n): ' + (($forward | ForEach-Object { $_.Name }) -join ', ')) }
+    foreach ($f in $forward) {
+        if ($f.DynUpdate -eq 'None') {
+            Write-Log -Level Warn -Message ('In der Zone {0} sind dynamische Updates aus. Clients und DHCP koennen sich dann nicht eintragen.' -f $f.Name)
+            if (Read-NetYesNo -Frage 'Dynamische Updates einschalten?' -Vorschlag $true) {
+                $wert = 'NonsecureAndSecure'
+                if ($f.AdIntegriert) { $wert = 'Secure' }
+                Set-NetDnsZoneUpdate -Zone $f.Name -Wert $wert | Out-Null
+            }
+        }
+    }
+    $fehlend = @(Get-NetMissingReverseZone -Zustand (Get-NetSetupState))
+    if ($fehlend.Count -gt 0) { Add-NetMissingReverseZone }
+    else { Write-Log -Level OK -Message 'Reverse-Zonen fuer alle Netze vorhanden.' }
+    if (@(Get-NetDnsForwarderList).Count -eq 0) {
+        Write-Log -Level Warn -Message 'Es ist keine Weiterleitung eingestellt.'
+        if (Read-NetYesNo -Frage 'Jetzt Weiterleitungen einstellen?' -Vorschlag $true) { Set-NetDnsForwarder | Out-Null }
+    }
+    else { Write-Log -Level OK -Message ('Weiterleitungen: ' + (@(Get-NetDnsForwarderList) -join ', ')) }
+    $sc = Get-NetSafe -Beschreibung 'Scavenging' -Abfrage { Get-DnsServerScavenging }
+    if ($sc -and -not $sc.ScavengingState) {
+        Write-Log -Level Warn -Message 'Das Aufraeumen alter Eintraege (Scavenging) ist aus.'
+        if (Read-NetYesNo -Frage 'Mit Vorschlag 7 + 7 Tage einschalten?' -Vorschlag $true) { Set-NetDnsScavenging -Aktiv $true | Out-Null }
+    }
+    Write-Log -Level OK -Message 'DNS-Einrichtung abgeschlossen.'
+}
+#
+function Show-NetDnsZoneMenu {
+    $eintraege = @(
+        @{ Text = 'Zonen anzeigen'; Aktion = 'Show-NetDnsZone'; Hilfe = 'Alle Zonen mit Typ, Speicherung (AD oder Datei) und dynamischen Updates.' },
+        @{ Text = 'Forward-Zone anlegen'; Aktion = 'New-NetDnsForwardZone'; Hilfe = "Zone fuer Namen -> Adressen. Auf einem DC AD-integriert (Replikation Domain oder Forest), sonst als Datei.`nExistiert die Zone schon, passiert nichts." },
+        @{ Text = 'Reverse-Zone anlegen'; Aktion = { New-NetDnsReverseZone }; Hilfe = 'Zone fuer Adressen -> Namen (PTR) eines Netzes, z. B. 1.168.192.in-addr.arpa fuer 192.168.1.0/24.' },
+        @{ Text = 'Fehlende Reverse-Zonen vorschlagen'; Aktion = 'Add-NetMissingReverseZone'; Hilfe = 'Prueft das Netz des Servers und alle DHCP-Scopes und schlaegt fehlende Reverse-Zonen vor.' },
+        @{ Text = 'Dynamische Updates einstellen'; Aktion = { Set-NetDnsZoneUpdate | Out-Null }; Hilfe = 'Nur sicher (empfohlen, nur AD-Zonen), sicher und unsicher, oder aus.' },
+        @{ Text = 'Zone loeschen (gefaehrlich)'; Aktion = 'Remove-NetDnsZone'; Hilfe = 'Loescht eine Zone mit allen Eintraegen. Vorher wird automatisch gesichert; der Servername muss eingetippt werden.' }
+    )
+    Show-NetMenu -Titel 'DNS - Zonen' -Eintraege $eintraege
+}
+#
+function Show-NetDnsRecordMenu {
+    $eintraege = @(
+        @{ Text = 'Eintraege einer Zone anzeigen'; Aktion = 'Show-NetDnsRecord'; Hilfe = 'Listet alle Eintraege einer Zone, mit statisch/dynamisch und Zeitstempel.' },
+        @{ Text = 'Eintrag suchen'; Aktion = { Find-NetDnsRecord | Out-Null }; Hilfe = 'Sucht einen Namen oder eine Adresse in allen Zonen.' },
+        @{ Text = 'Eintrag anlegen (A, AAAA, CNAME, MX, SRV, TXT, PTR)'; Aktion = { Add-NetDnsRecord | Out-Null }; Hilfe = "Legt einen Eintrag an. Vorher wird geprueft, ob es ihn schon gibt (dann passiert nichts) oder ob er mit einem anderen kollidiert.`nA-Eintraege koennen gleich den passenden PTR bekommen." },
+        @{ Text = 'Eintrag aendern'; Aktion = { Edit-NetDnsRecord | Out-Null }; Hilfe = 'Aendert die Daten eines Eintrags (z. B. neue IP). Vorher/Nachher wird angezeigt, rueckgaengig moeglich.' },
+        @{ Text = 'Eintrag loeschen'; Aktion = { Remove-NetDnsRecord | Out-Null }; Hilfe = 'Loescht genau einen Eintrag. Die Gegenaktion (wieder anlegen) wird gemerkt.' }
+    )
+    Show-NetMenu -Titel 'DNS - Eintraege' -Eintraege $eintraege
+}
+#
+function Show-NetDnsMenu {
+    $eintraege = @(
+        @{ Text = 'Uebersicht'; Aktion = 'Show-NetDnsOverview'; Hilfe = 'Zonen, Weiterleitungen, Aufraeumen, Abhoer-Adressen und fehlende Reverse-Zonen auf einen Blick.' },
+        @{ Text = 'DNS einrichten (Assistent)'; Aktion = 'Start-NetDnsSetup'; Hilfe = 'Prueft Rolle, Forward-Zone, dynamische Updates, Reverse-Zonen, Weiterleitungen und Aufraeumen und bietet an, was fehlt. Erledigtes wird uebersprungen.' },
+        @{ Text = 'Zonen'; Aktion = 'Show-NetDnsZoneMenu'; OhnePause = $true; Hilfe = 'Zonen anzeigen, anlegen, dynamische Updates, fehlende Reverse-Zonen, loeschen.' },
+        @{ Text = 'Eintraege'; Aktion = 'Show-NetDnsRecordMenu'; OhnePause = $true; Hilfe = 'Eintraege anzeigen, suchen, anlegen, aendern, loeschen.' },
+        @{ Text = 'Weiterleitungen'; Aktion = 'Show-NetDnsForwarderMenu'; OhnePause = $true; Hilfe = 'Weiterleitungen (Quad9, Cloudflare, Router) und bedingte Weiterleitungen. Erklaert auch den Unterschied zu den Stammhinweisen.' },
+        @{ Text = 'Aufraeumen alter Eintraege (Aging/Scavenging)'; Aktion = 'Show-NetDnsAgingMenu'; OhnePause = $true; Hilfe = 'Assistent mit Vorschlag 7 + 7 Tage, Erklaerung zur Lease-Dauer und Modus "nur melden".' },
+        @{ Text = 'Abhoer-IP-Adressen'; Aktion = 'Edit-NetDnsListenAddress'; Hilfe = 'Auf welchen Adressen der DNS-Server antwortet. Empfohlen: alle festen Adressen des Servers.' },
+        @{ Text = 'DNS-Rolle installieren / pruefen'; Aktion = { Install-NetDnsRole | Out-Null }; Hilfe = 'Installiert die DNS-Server-Rolle und die Verwaltungstools aus dem lokalen Windows, falls sie fehlen.' }
+    )
+    Show-NetMenu -Titel 'DNS' -Eintraege $eintraege
 }
 # ----------------------------------------------------------------------
 # src/ui/Ersteinrichtung.ps1
