@@ -47,6 +47,7 @@
         'src/wartung/CsvImport.ps1'
         'src/wartung/Berichte.ps1'
         'src/wartung/WartungMenue.ps1'
+        'src/erweitert/Erweitert.ps1'
         'src/ui/Ersteinrichtung.ps1'
         'src/ui/Hauptmenue.ps1'
         'src/core/Start.ps1'

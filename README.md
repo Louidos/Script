@@ -26,7 +26,8 @@ Active Directory (neue Gesamtstruktur, zusätzlicher DC, Beitritt) mit Fortsetzu
 DNS (Zonen, Einträge, Weiterleitungen, Aufräumen, Abhör-Adressen);
 DHCP (Scopes, Optionen, Reservierungen, Leases, Failover); DHCP trägt automatisch in DNS ein;
 Doktor mit Prüfkatalog und Reparatur, `-Task Health` für geplante Prüfungen;
-Backup, Wiederherstellen, Rückgängig, Serverumzug, CSV-Import und Berichte.
+Backup, Wiederherstellen, Rückgängig, Serverumzug, CSV-Import und Berichte;
+Erweitert (DNSSEC, Split-Brain, DHCP-Richtlinien, Sperrliste, DHCPv6).
 Die übrigen Menüpunkte sind als „kommt noch“ markiert.
 Details siehe [CHANGELOG.md](CHANGELOG.md).
 
