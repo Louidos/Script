@@ -1,5 +1,5 @@
 <#
-    NetSetup 0.0.0 (Build 2026-10-22 21:14)
+    NetSetup 0.0.0 (Build 2026-10-22 21:18)
     AD, DNS und DHCP auf Windows Server einrichten, verwalten und reparieren.
 #
     So starten (PowerShell oder PowerShell ISE als Administrator):
@@ -14,7 +14,7 @@
 #>
 $NetSetupCode = {
 $script:NetSetupVersion = '0.0.0'
-$script:NetSetupBuildDatum = '2026-10-22 21:14'
+$script:NetSetupBuildDatum = '2026-10-22 21:18'
 # ----------------------------------------------------------------------
 # src/core/Zustand.ps1
 # ----------------------------------------------------------------------
@@ -1683,6 +1683,7 @@ function Confirm-NetDangerous {
     .SYNOPSIS
         Zweite Sicherheitsstufe: der Servername muss eingetippt werden.
     #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseSingularNouns', '', Justification = 'Dangerous ist ein Adjektiv, kein Plural; der Name ist vorgegeben.')]
     param([Parameter(Mandatory = $true)][string]$Titel, [string]$Hinweis)
     if (-not $script:NS.Interaktiv) { return $false }
     $name = [Environment]::MachineName

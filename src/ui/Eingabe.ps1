@@ -291,6 +291,7 @@ function Confirm-NetDangerous {
     .SYNOPSIS
         Zweite Sicherheitsstufe: der Servername muss eingetippt werden.
     #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseSingularNouns', '', Justification = 'Dangerous ist ein Adjektiv, kein Plural; der Name ist vorgegeben.')]
     param([Parameter(Mandatory = $true)][string]$Titel, [string]$Hinweis)
     if (-not $script:NS.Interaktiv) { return $false }
     $name = [Environment]::MachineName
