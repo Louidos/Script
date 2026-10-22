@@ -37,6 +37,7 @@
         'src/dhcp/DhcpReservierung.ps1'
         'src/dhcp/DhcpFailover.ps1'
         'src/dhcp/DhcpMenue.ps1'
+        'src/integration/Verbindung.ps1'
         'src/ui/Ersteinrichtung.ps1'
         'src/ui/Hauptmenue.ps1'
         'src/core/Start.ps1'
